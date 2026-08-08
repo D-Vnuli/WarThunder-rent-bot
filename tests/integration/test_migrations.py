@@ -1,0 +1,59 @@
+import os
+import sqlite3
+import subprocess
+import sys
+
+
+def test_upgrade_downgrade_upgrade_uses_immutable_revision(tmp_path):
+    database = tmp_path / "migration.db"
+    environment = {**os.environ, "DATABASE_URL": f"sqlite:///{database.as_posix()}"}
+    command = [sys.executable, "-m", "alembic", "-c", "alembic.ini"]
+    subprocess.run([*command, "upgrade", "head"], check=True, env=environment)
+
+
+def test_phase2_upgrade_and_downgrade_preserve_phase1_schema(tmp_path):
+    database = tmp_path / "phase2-migration.db"
+    environment = {**os.environ, "DATABASE_URL": f"sqlite:///{database.as_posix()}"}
+    command = [sys.executable, "-m", "alembic", "-c", "alembic.ini"]
+    subprocess.run([*command, "upgrade", "0001_phase1_core"], check=True, env=environment)
+    subprocess.run([*command, "upgrade", "0002_phase2_email_security"], check=True, env=environment)
+    with sqlite3.connect(database) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute("select name from sqlite_master where type='table'")
+        }
+    assert {
+        "processed_messages",
+        "classified_email_events",
+        "otp_requests",
+        "security_events",
+    } <= tables
+    subprocess.run([*command, "downgrade", "0001_phase1_core"], check=True, env=environment)
+    with sqlite3.connect(database) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute("select name from sqlite_master where type='table'")
+        }
+    assert {"accounts", "orders", "rentals", "operations", "audit_events"} <= tables
+    assert "classified_email_events" not in tables
+    subprocess.run([*command, "upgrade", "head"], check=True, env=environment)
+    with sqlite3.connect(database) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("pragma table_info(classified_email_events)")
+        }
+    assert {"security_processing_state", "security_claim_token", "security_claimed_at"} <= columns
+    with sqlite3.connect(database) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute("select name from sqlite_master where type='table'")
+        }
+    assert {"accounts", "orders", "rentals", "operations", "audit_events"} <= tables
+    subprocess.run([*command, "downgrade", "base"], check=True, env=environment)
+    with sqlite3.connect(database) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute("select name from sqlite_master where type='table'")
+        }
+    assert "accounts" not in tables
+    subprocess.run([*command, "upgrade", "head"], check=True, env=environment)
