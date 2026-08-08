@@ -25,6 +25,7 @@ from app.persistence.models import (
     OperationRow,
     SecurityEventRow,
 )
+from tests.helpers import create_test_account
 
 SENDER = "login@pixstorm.ru"
 PASSWORD_SUBJECT = "Подтверждение смены пароля для учетной записи"
@@ -75,8 +76,8 @@ def _password_change(message_id, now, account_id=None):
 
 
 def _active_rental(core, now, duration=3600):
-    repository, manager, _, _ = core
-    account_id = repository.add_account("WT01", now)
+    repository, manager, funpay, _ = core
+    account_id = create_test_account(repository, funpay, "WT01", now)
     result = manager.accept_order(OrderInput("order", "buyer", "1H", duration), now)
     manager.run_operations(now)
     manager.run_operations(now)

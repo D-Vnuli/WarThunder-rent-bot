@@ -9,19 +9,22 @@ from app.domain.models import OrderInput
 from app.domain.states import AccountStatus, FulfillmentStatus
 from app.persistence.database import Database
 from app.persistence.repositories import Repository
+from tests.helpers import create_test_account
 
 
 def _manager(path: Path):
     db = Database(f"sqlite:///{path.as_posix()}")
     db.create_schema()
     repo = Repository(db)
-    manager = RentalManager(repo, FakeFunPayAdapter(), FakeGaijinController(), FakeSecureStore())
+    secrets = FakeSecureStore()
+    repo._test_secret_store = secrets  # type: ignore[attr-defined]
+    manager = RentalManager(repo, FakeFunPayAdapter(), FakeGaijinController(), secrets)
     return repo, manager
 
 
 def test_file_sqlite_persists_blocked_orders_under_competing_orders(tmp_path, now):
     repo, manager = _manager(tmp_path / "concurrency.db")
-    repo.add_account("WT01", now)
+    create_test_account(repo, manager.funpay, "WT01", now)
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(
             pool.map(
@@ -42,7 +45,7 @@ def test_file_sqlite_persists_blocked_orders_under_competing_orders(tmp_path, no
 
 def test_file_sqlite_uses_all_available_accounts(tmp_path, now):
     repo, manager = _manager(tmp_path / "multi-account.db")
-    repo.add_account("WT01", now)
+    create_test_account(repo, manager.funpay, "WT01", now)
     repo.add_account("WT02", now)
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(
@@ -107,33 +110,31 @@ def test_expired_lease_only_one_worker_reclaims(tmp_path, now):
 
 def test_restart_after_completed_effect_does_not_replay_credentials(tmp_path, now):
     repo, manager = _manager(tmp_path / "restart.db")
-    repo.add_account("WT01", now)
+    create_test_account(repo, manager.funpay, "WT01", now)
     result = manager.accept_order(OrderInput("order", "buyer", "1H", 60), now)
     manager.run_operations(now)
     manager.run_operations(now)
     # A new application worker only sees completed durable operations.
     manager.run_operations(now + timedelta(seconds=1))
-    assert len(manager.funpay.sent_credentials) == 1
+    assert manager.funpay.message_send_count == 1
     assert result.rental_id is not None
 
 
 def test_crash_after_credentials_send_is_fail_closed_without_second_send(tmp_path, now):
     repo, manager = _manager(tmp_path / "credentials-crash.db")
-    repo.add_account("WT01", now)
+    create_test_account(repo, manager.funpay, "WT01", now)
     manager.accept_order(OrderInput("order", "buyer", "1H", 60), now)
     manager.run_operations(now)  # disable lots -> durable SEND_CREDENTIALS
     operation = repo.pending_operations()[0]
-    assert manager.funpay.send_credentials(
-        operation.rental_id or ""
-    )  # external success, no DB completion
+    assert manager._send_credentials(operation, now)  # external success, no DB completion
     assert repo.claim_operation(operation.id, now) is not None
     assert StartupReconciliation(repo).run(now + timedelta(seconds=31)) == 1
-    assert len(manager.funpay.sent_credentials) == 1
+    assert manager.funpay.message_send_count == 1
 
 
 def test_rotation_crash_preserves_historical_rental_version(tmp_path, now):
     repo, manager = _manager(tmp_path / "rotation-crash.db")
-    account_id = repo.add_account("WT01", now)
+    account_id = create_test_account(repo, manager.funpay, "WT01", now)
     result = manager.accept_order(OrderInput("order", "buyer", "1H", 1), now)
     manager.run_operations(now)
     manager.run_operations(now)

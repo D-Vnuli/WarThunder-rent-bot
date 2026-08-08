@@ -8,11 +8,12 @@ from app.domain.states import AccountStatus, OperationKind, RentalStatus
 from app.domain.transitions import require_account_transition
 from app.persistence.models import OperationRow
 from app.persistence.repositories import StateConflictError
+from tests.helpers import create_test_account
 
 
 def _start_active_rental(core, now):
-    repository, manager, _, _ = core
-    account_id = repository.add_account("WT01", now)
+    repository, manager, funpay, _ = core
+    account_id = create_test_account(repository, funpay, "WT01", now)
     result = manager.accept_order(OrderInput("order", "buyer", "1H", 60), now)
     manager.run_operations(now)
     manager.run_operations(now)

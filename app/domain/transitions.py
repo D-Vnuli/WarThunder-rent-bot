@@ -3,7 +3,7 @@ from app.domain.states import AccountStatus, RentalStatus
 ACCOUNT_TRANSITIONS: dict[AccountStatus, set[AccountStatus]] = {
     AccountStatus.AVAILABLE: {AccountStatus.RESERVED, AccountStatus.DISABLED},
     AccountStatus.RESERVED: {AccountStatus.ACTIVE, AccountStatus.MANUAL_REVIEW},
-    AccountStatus.ACTIVE: {AccountStatus.EXPIRING, AccountStatus.SECURITY_ALERT},
+    AccountStatus.ACTIVE: {AccountStatus.EXPIRING, AccountStatus.SECURITY_ALERT, AccountStatus.MANUAL_REVIEW},
     AccountStatus.EXPIRING: {AccountStatus.REVOKING, AccountStatus.MANUAL_REVIEW},
     AccountStatus.REVOKING: {AccountStatus.ROTATING_PASSWORD, AccountStatus.MANUAL_REVIEW},
     AccountStatus.ROTATING_PASSWORD: {AccountStatus.AVAILABLE_OFFLINE, AccountStatus.MANUAL_REVIEW},
@@ -26,6 +26,7 @@ def require_rental_transition(current: str, target: RentalStatus) -> None:
             RentalStatus.EXPIRING,
             RentalStatus.REVOKING,
             RentalStatus.SECURITY_TERMINATED,
+            RentalStatus.MANUAL_REVIEW,
         },
         RentalStatus.EXPIRING: {RentalStatus.REVOKING, RentalStatus.MANUAL_REVIEW},
         RentalStatus.REVOKING: {RentalStatus.PASSWORD_ROTATION, RentalStatus.MANUAL_REVIEW},

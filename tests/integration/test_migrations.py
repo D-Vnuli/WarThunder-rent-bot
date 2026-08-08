@@ -48,6 +48,20 @@ def test_phase2_upgrade_and_downgrade_preserve_phase1_schema(tmp_path):
             row[0]
             for row in connection.execute("select name from sqlite_master where type='table'")
         }
+    assert {"account_lots", "funpay_events", "message_receipts"} <= tables
+    subprocess.run([*command, "downgrade", "0003_phase2_security_dispatch"], check=True, env=environment)
+    with sqlite3.connect(database) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute("select name from sqlite_master where type='table'")
+        }
+    assert "funpay_events" not in tables
+    assert "classified_email_events" in tables
+    with sqlite3.connect(database) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute("select name from sqlite_master where type='table'")
+        }
     assert {"accounts", "orders", "rentals", "operations", "audit_events"} <= tables
     subprocess.run([*command, "downgrade", "base"], check=True, env=environment)
     with sqlite3.connect(database) as connection:

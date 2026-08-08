@@ -16,6 +16,7 @@ from app.domain.states import (
 from app.domain.transitions import require_account_transition, require_rental_transition
 from app.persistence.database import Database
 from app.persistence.models import (
+    AccountLotRow,
     AccountRow,
     AuditEventRow,
     OperationRow,
@@ -48,6 +49,29 @@ class Repository:
             session.add(row)
             session.flush()
             return row.id
+
+    def add_account_lot(self, account_id: str, external_lot_id: str, now: datetime) -> str:
+        with self.db.session() as session, session.begin():
+            row = AccountLotRow(
+                account_id=account_id,
+                external_lot_id=external_lot_id,
+                enabled_expected=True,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+            session.flush()
+            return row.id
+
+    def account_lot_ids(self, account_id: str) -> list[str]:
+        with self.db.session() as session:
+            return list(
+                session.scalars(
+                    select(AccountLotRow.external_lot_id)
+                    .where(AccountLotRow.account_id == account_id)
+                    .order_by(AccountLotRow.external_lot_id)
+                )
+            )
 
     def reserve_order(self, order: OrderInput, now: datetime) -> StartResult:
         for attempt in range(5):
@@ -147,6 +171,32 @@ class Repository:
                     .order_by(OperationRow.created_at)
                 )
             )
+
+    def recoverable_message_operations(self) -> list[OperationRow]:
+        with self.db.session() as session:
+            return list(
+                session.scalars(
+                    select(OperationRow).where(
+                        OperationRow.kind.in_([OperationKind.SEND_CREDENTIALS, OperationKind.SEND_OTP]),
+                        OperationRow.status == OperationStatus.RUNNING,
+                    )
+                )
+            )
+
+    def expired_running_operations(self, now: datetime) -> list[OperationRow]:
+        with self.db.session() as session:
+            return list(
+                session.scalars(
+                    select(OperationRow).where(
+                        OperationRow.status == OperationStatus.RUNNING,
+                        OperationRow.lease_until < now,
+                    )
+                )
+            )
+
+    def running_operations(self) -> list[OperationRow]:
+        with self.db.session() as session:
+            return list(session.scalars(select(OperationRow).where(OperationRow.status == OperationStatus.RUNNING)))
 
     def claim_operation(
         self, operation_id: str, now: datetime, lease_seconds: int = 30

@@ -38,6 +38,7 @@ class OperationKind(StrEnum):
     REVOKE_SESSIONS = "REVOKE_SESSIONS"
     ROTATE_PASSWORD = "ROTATE_PASSWORD"
     ENABLE_LOTS = "ENABLE_LOTS"
+    SEND_OTP = "SEND_OTP"
 
 
 class OperationStatus(StrEnum):

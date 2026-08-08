@@ -18,6 +18,7 @@ from app.application.gmail_watcher import GmailWatcher
 from app.application.otp_service import OTPService
 from app.domain.models import OrderInput
 from app.persistence.classified_email_events import ClassifiedEmailRepository
+from tests.helpers import create_test_account
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "email"
 NOW = datetime(2026, 8, 8, 12, tzinfo=UTC)
@@ -80,8 +81,8 @@ def _service():
 
 
 def _active_rental(core):
-    repository, manager, _, _ = core
-    account_id = repository.add_account("WT01", NOW)
+    repository, manager, funpay, _ = core
+    account_id = create_test_account(repository, funpay, "WT01", NOW)
     order = manager.accept_order(OrderInput("gmail-order", "buyer", "1H", 3600), NOW)
     manager.run_operations(NOW)
     manager.run_operations(NOW)

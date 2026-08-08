@@ -1,0 +1,1 @@
+"""Safe customer-message templates."""

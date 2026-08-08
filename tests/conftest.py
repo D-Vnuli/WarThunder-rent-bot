@@ -19,4 +19,5 @@ def core():
     database.create_schema()
     repository = Repository(database)
     funpay, gaijin, secrets = FakeFunPayAdapter(), FakeGaijinController(), FakeSecureStore()
+    repository._test_secret_store = secrets  # type: ignore[attr-defined]
     return repository, RentalManager(repository, funpay, gaijin, secrets), funpay, gaijin

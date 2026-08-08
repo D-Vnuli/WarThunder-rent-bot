@@ -16,6 +16,9 @@ class LotOperationResult:
     changed: int
     verified: bool
     failed_lot_ids: tuple[str, ...] = ()
+    observed_lot_states: tuple[tuple[str, bool], ...] = ()
+    external_reference: str | None = None
+    safe_error_category: str | None = None
 
 
 @dataclass(frozen=True)

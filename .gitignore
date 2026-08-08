@@ -1,9 +1,160 @@
+# ============================================================
+# WarThunder-rent-bot
+# ============================================================
+
+# ------------------------------------------------------------
+# Environment / secrets
+# ------------------------------------------------------------
+
 .env
+.env.*
+!.env.example
+
+secrets/
+.secrets/
+private/
+.private/
+
+# OAuth / API credentials
+credentials.json
+credentials*.json
+client_secret*.json
+token.json
+token*.json
+oauth*.json
+
+# Keys / certificates
+*.key
+*.pem
+*.p12
+*.pfx
+
+# ------------------------------------------------------------
+# Runtime sessions / authentication state
+# ------------------------------------------------------------
+
+sessions/
+.session/
+.sessions/
+runtime/
+.runtime/
+
+cookies.json
+cookies*.json
+session.json
+session*.json
+
+# ------------------------------------------------------------
+# Databases
+# ------------------------------------------------------------
+
+data/*.db
+data/*.db-*
+data/*.sqlite
+data/*.sqlite3
+data/*.sqlite-*
+data/*.sqlite3-*
+
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+
+# ------------------------------------------------------------
+# Real email exports
+#
+# Real .eml files must never enter the public repository.
+# Only explicitly sanitized test fixtures may be committed.
+# ------------------------------------------------------------
+
+*.eml
+
+!tests/fixtures/**/*.eml
+!fixtures/**/*.eml
+
+# ------------------------------------------------------------
+# Logs / dumps / temporary runtime files
+# ------------------------------------------------------------
+
+*.log
+logs/
+log/
+
+*.tmp
+*.temp
+*.bak
+*.swp
+
+dump/
+dumps/
+
+# ------------------------------------------------------------
+# Python
+# ------------------------------------------------------------
+
 .venv/
+venv/
+env/
+
 __pycache__/
 *.py[cod]
+*$py.class
+
+*.egg-info/
+.eggs/
+
+build/
+dist/
+
+# ------------------------------------------------------------
+# Tests / coverage / linters
+# ------------------------------------------------------------
+
 .pytest_cache/
 .pytest_tmp/
 .mypy_cache/
 .ruff_cache/
-data/*.db
+
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ------------------------------------------------------------
+# IDE
+# ------------------------------------------------------------
+
+.idea/
+.vscode/
+
+*.code-workspace
+
+# ------------------------------------------------------------
+# OS files
+# ------------------------------------------------------------
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ------------------------------------------------------------
+# Local application files
+# ------------------------------------------------------------
+
+*.local
+local/
+.local/
+
+# ------------------------------------------------------------
+# Playwright / browser state
+# Future PHASE 4 protection
+# ------------------------------------------------------------
+
+playwright/.auth/
+playwright-report/
+test-results/
+
+browser_state/
+storage_state.json

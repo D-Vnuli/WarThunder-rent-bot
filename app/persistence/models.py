@@ -140,3 +140,53 @@ class SecurityEventRow(Base):
     severity: Mapped[str] = mapped_column(String(16))
     occurred_at: Mapped[datetime] = mapped_column(UTCDateTime())
     safe_metadata: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class AccountLotRow(Base):
+    __tablename__ = "account_lots"
+    __table_args__ = (UniqueConstraint("external_lot_id", name="uq_account_lot_external"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), index=True)
+    external_lot_id: Mapped[str] = mapped_column(String(128))
+    enabled_expected: Mapped[bool] = mapped_column(default=True)
+    safe_metadata: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class FunPayEventRow(Base):
+    __tablename__ = "funpay_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    external_event_id: Mapped[str] = mapped_column(String(180), unique=True)
+    event_type: Mapped[str] = mapped_column(String(32), index=True)
+    funpay_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    buyer_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    buyer_handle: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lot_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    offer_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    tariff_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    message_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    received_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    processing_status: Mapped[str] = mapped_column(String(32), index=True)
+    claim_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    correlation_id: Mapped[str] = mapped_column(String(180))
+    safe_metadata: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class MessageReceiptRow(Base):
+    __tablename__ = "message_receipts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    idempotency_key: Mapped[str] = mapped_column(String(180), unique=True)
+    funpay_event_id: Mapped[str | None] = mapped_column(ForeignKey("funpay_events.id"), nullable=True)
+    conversation_id: Mapped[str] = mapped_column(String(128))
+    external_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    delivery_status: Mapped[str] = mapped_column(String(32))
+    verified: Mapped[bool] = mapped_column(default=False)
+    ambiguous: Mapped[bool] = mapped_column(default=False)
+    occurred_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    safe_metadata: Mapped[str] = mapped_column(Text, default="{}")

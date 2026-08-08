@@ -21,14 +21,15 @@ from app.domain.states import (
 )
 from app.persistence.classified_email_events import ClassifiedEmailRepository
 from app.persistence.models import ClassifiedEmailEventRow, OperationRow, SecurityEventRow
+from tests.helpers import create_test_account
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "email"
 NOW = datetime(2026, 8, 8, 12, tzinfo=UTC)
 
 
 def _active_rental(core, now=NOW):
-    repository, manager, _, _ = core
-    account_id = repository.add_account("WT01", now)
+    repository, manager, funpay, _ = core
+    account_id = create_test_account(repository, funpay, "WT01", now)
     started = manager.accept_order(OrderInput("real-format-order", "buyer", "1H", 3600), now)
     manager.run_operations(now)
     manager.run_operations(now)
