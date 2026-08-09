@@ -217,6 +217,7 @@ def test_expected_password_change_is_correlated_to_rotation_operation(core, now)
             correlation_id="test-rotation",
             created_at=now,
             started_at=now,
+            password_change_requested_at=now,
         )
         session.add(operation)
         session.flush()

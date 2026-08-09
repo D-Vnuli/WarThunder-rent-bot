@@ -77,6 +77,7 @@ def test_real_format_html_password_change_never_enters_otp_path(core):
             correlation_id="real-format-rotation",
             created_at=NOW,
             started_at=NOW,
+            password_change_requested_at=NOW,
         )
         session.add(operation)
         session.flush()

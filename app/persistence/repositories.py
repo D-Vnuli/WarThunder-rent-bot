@@ -1,7 +1,8 @@
 from datetime import UTC, datetime, timedelta
 from time import sleep
+from uuid import uuid4
 
-from sqlalchemy import exists, select, update
+from sqlalchemy import exists, or_, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
@@ -35,8 +36,15 @@ class StateConflictError(RuntimeError):
 
 
 class Repository:
-    def __init__(self, database: Database) -> None:
+    def __init__(
+        self,
+        database: Database,
+        maintenance_otp_correlation_seconds: int = 300,
+        password_change_correlation_seconds: int = 900,
+    ) -> None:
         self.db = database
+        self._maintenance_otp_correlation_seconds = maintenance_otp_correlation_seconds
+        self._password_change_correlation_seconds = password_change_correlation_seconds
 
     def add_account(self, code: str, now: datetime | None = None) -> str:
         now = now or utcnow()
@@ -198,6 +206,65 @@ class Repository:
         with self.db.session() as session:
             return list(session.scalars(select(OperationRow).where(OperationRow.status == OperationStatus.RUNNING)))
 
+    def waiting_security_operations(self) -> list[OperationRow]:
+        with self.db.session() as session:
+            return list(
+                session.scalars(
+                    select(OperationRow).where(
+                        OperationRow.status == OperationStatus.RUNNING,
+                        OperationRow.security_state.in_(["WAITING_LOGIN_OTP", "WAITING_PASSWORD_CHANGE_EMAIL"]),
+                    )
+                )
+            )
+
+    def claim_startup_recovery(self, operation_id: str, now: datetime) -> OperationRow | None:
+        """CAS ownership for destructive startup recovery; no Python lock."""
+        token = str(uuid4())
+        with self.db.session() as session, session.begin():
+            claimed = session.execute(
+                update(OperationRow)
+                .where(
+                    OperationRow.id == operation_id,
+                    OperationRow.status == OperationStatus.RUNNING,
+                    # An active normal-worker lease is durable evidence that
+                    # startup must not issue a second destructive request.
+                    or_(OperationRow.lease_until.is_(None), OperationRow.lease_until < now),
+                )
+                .values(recovery_claim_token=token, lease_until=now + timedelta(minutes=5))
+            )
+            if (getattr(claimed, "rowcount", 0) or 0) != 1:
+                return None
+            operation = session.get(OperationRow, operation_id)
+            assert operation is not None
+            self._audit(
+                session,
+                "STARTUP_RECOVERY_CLAIMED",
+                operation.account_id,
+                operation.rental_id,
+                f"{operation_id}:{token}",
+                now,
+            )
+            return operation
+
+    def release_recovery_claim(
+        self, operation_id: str, recovery_claim_token: str, now: datetime
+    ) -> bool:
+        """Release ownership when recovery has durably entered a waiting state."""
+        with self.db.session() as session, session.begin():
+            released = session.execute(
+                update(OperationRow)
+                .where(
+                    OperationRow.id == operation_id,
+                    OperationRow.status == OperationStatus.RUNNING,
+                    OperationRow.recovery_claim_token == recovery_claim_token,
+                    OperationRow.security_state.in_(
+                        ["WAITING_LOGIN_OTP", "WAITING_PASSWORD_CHANGE_EMAIL"]
+                    ),
+                )
+                .values(recovery_claim_token=None, lease_until=None)
+            )
+            return (getattr(released, "rowcount", 0) or 0) == 1
+
     def claim_operation(
         self, operation_id: str, now: datetime, lease_seconds: int = 30
     ) -> OperationRow | None:
@@ -234,20 +301,32 @@ class Repository:
         with self.db.session() as session, session.begin():
             rows = list(
                 session.scalars(
-                    select(OperationRow).where(
-                        OperationRow.status == OperationStatus.RUNNING,
-                        OperationRow.lease_until < now,
-                    )
+                    select(OperationRow).where(OperationRow.status == OperationStatus.RUNNING)
                 )
             )
             recovered_count = 0
             for row in rows:
+                wait_deadline = self._external_wait_deadline(row)
+                waiting_external = row.security_state in {
+                    "WAITING_LOGIN_OTP",
+                    "WAITING_PASSWORD_CHANGE_EMAIL",
+                }
+                if waiting_external and wait_deadline is not None and wait_deadline > now:
+                    continue
+                if not waiting_external and (row.lease_until is None or row.lease_until >= now):
+                    continue
                 claimed = session.execute(
                     update(OperationRow)
                     .where(
                         OperationRow.id == row.id,
                         OperationRow.status == OperationStatus.RUNNING,
-                        OperationRow.lease_until < now,
+                        (
+                            OperationRow.security_state.in_(
+                                ["WAITING_LOGIN_OTP", "WAITING_PASSWORD_CHANGE_EMAIL"]
+                            )
+                            if waiting_external
+                            else OperationRow.lease_until < now
+                        ),
                     )
                     .values(status=OperationStatus.FAILED, completed_at=now, lease_until=None)
                 )
@@ -282,68 +361,121 @@ class Repository:
             rental = session.get(RentalRow, operation.rental_id) if operation.rental_id else None
             if account is None or rental is None:
                 raise StateConflictError("Revoke operation has no durable rental and account")
-            self._transition_account(session, account, AccountStatus.REVOKING, now)
-            self._transition_rental(rental, RentalStatus.REVOKING, now)
+            if account.status != AccountStatus.REVOKING:
+                self._transition_account(session, account, AccountStatus.REVOKING, now)
+            if rental.status != RentalStatus.REVOKING:
+                self._transition_rental(rental, RentalStatus.REVOKING, now)
             return operation
 
-    def operation_completed(self, operation_id: str, now: datetime) -> None:
+    def record_maintenance_login_requested(self, operation_id: str, now: datetime) -> bool:
+        with self.db.session() as session, session.begin():
+            changed = session.execute(
+                update(OperationRow)
+                .where(OperationRow.id == operation_id, OperationRow.status == OperationStatus.RUNNING)
+                .values(maintenance_login_requested_at=now)
+            )
+            return (getattr(changed, "rowcount", 0) or 0) == 1
+
+    def record_password_change_requested(self, operation_id: str, now: datetime) -> bool:
+        """Durable non-secret request intent, written before the external request."""
+        with self.db.session() as session, session.begin():
+            changed = session.execute(
+                update(OperationRow)
+                .where(
+                    OperationRow.id == operation_id,
+                    OperationRow.status == OperationStatus.RUNNING,
+                    OperationRow.password_change_requested_at.is_(None),
+                )
+                .values(password_change_requested_at=now)
+            )
+            return (getattr(changed, "rowcount", 0) or 0) == 1
+
+    def set_security_state(self, operation_id: str, state: str, now: datetime) -> bool:
+        with self.db.session() as session, session.begin():
+            changed = session.execute(
+                update(OperationRow)
+                .where(OperationRow.id == operation_id, OperationRow.status == OperationStatus.RUNNING)
+                .values(
+                    security_state=state,
+                    # External waits deliberately have no active execution
+                    # lease; their own bounded deadlines are enforced below.
+                    lease_until=(
+                        None
+                        if state in {"WAITING_LOGIN_OTP", "WAITING_PASSWORD_CHANGE_EMAIL"}
+                        else now + timedelta(minutes=5)
+                    ),
+                )
+            )
+            return (getattr(changed, "rowcount", 0) or 0) == 1
+
+    def operation_completed(
+        self, operation_id: str, now: datetime, recovery_claim_token: str | None = None
+    ) -> bool:
+        if recovery_claim_token is not None:
+            return self.complete_recovery_operation(operation_id, recovery_claim_token, now)
         with self.db.session() as session, session.begin():
             op = session.get(OperationRow, operation_id)
             if op is None or op.status == OperationStatus.COMPLETED:
-                return
-            op.status, op.completed_at, op.lease_until = OperationStatus.COMPLETED, now, None
-            rental = session.get(RentalRow, op.rental_id) if op.rental_id else None
-            account = session.get(AccountRow, op.account_id)
-            if account is None:
-                return
-            if op.kind == OperationKind.DISABLE_LOTS and rental:
-                self._operation(session, OperationKind.SEND_CREDENTIALS, account.id, rental.id, now)
-            elif op.kind == OperationKind.SEND_CREDENTIALS and rental:
-                self._transition_rental(rental, RentalStatus.ACTIVE, now)
-                rental.started_at = now
-                order = session.get(OrderRow, rental.order_id)
-                if order:
-                    rental.expires_at = now + timedelta(seconds=order.duration_seconds)
-                    order.fulfillment_status = FulfillmentStatus.ACTIVATED
-                self._transition_account(session, account, AccountStatus.ACTIVE, now)
-                self._audit(
-                    session, "RENTAL_STARTED", account.id, rental.id, op.idempotency_key, now
-                )
-            elif op.kind == OperationKind.REVOKE_SESSIONS and rental:
-                self._transition_account(session, account, AccountStatus.ROTATING_PASSWORD, now)
-                self._transition_rental(rental, RentalStatus.PASSWORD_ROTATION, now)
-                self._operation(session, OperationKind.ROTATE_PASSWORD, account.id, rental.id, now)
-            elif op.kind == OperationKind.ROTATE_PASSWORD and rental:
-                self._transition_account(session, account, AccountStatus.AVAILABLE_OFFLINE, now)
-                account.credential_version += 1
-                self._operation(session, OperationKind.ENABLE_LOTS, account.id, rental.id, now)
-            elif op.kind == OperationKind.ENABLE_LOTS and rental:
-                self._transition_account(session, account, AccountStatus.AVAILABLE, now)
-                self._transition_rental(rental, RentalStatus.FINISHED, now)
-                self._audit(
-                    session, "RENTAL_FINISHED", account.id, rental.id, op.idempotency_key, now
-                )
+                return False
+            op.status, op.completed_at, op.lease_until, op.recovery_claim_token = OperationStatus.COMPLETED, now, None, None
+            return self._complete_operation_row(session, op, now)
 
-    def operation_failed(self, operation_id: str, now: datetime) -> None:
+    def complete_recovery_operation(
+        self, operation_id: str, recovery_claim_token: str, now: datetime
+    ) -> bool:
+        """Finalize recovery only while this worker still owns its durable lease."""
+        with self.db.session() as session, session.begin():
+            changed = session.execute(
+                update(OperationRow)
+                .where(
+                    OperationRow.id == operation_id,
+                    OperationRow.status == OperationStatus.RUNNING,
+                    OperationRow.recovery_claim_token == recovery_claim_token,
+                )
+                .values(
+                    status=OperationStatus.COMPLETED,
+                    completed_at=now,
+                    lease_until=None,
+                    recovery_claim_token=None,
+                )
+            )
+            if (getattr(changed, "rowcount", 0) or 0) != 1:
+                return False
+            operation = session.get(OperationRow, operation_id)
+            assert operation is not None
+            return self._complete_operation_row(session, operation, now)
+
+    def operation_failed(
+        self, operation_id: str, now: datetime, recovery_claim_token: str | None = None
+    ) -> bool:
+        if recovery_claim_token is not None:
+            return self.fail_recovery_operation(operation_id, recovery_claim_token, now)
         with self.db.session() as session, session.begin():
             operation = session.get(OperationRow, operation_id)
             if operation is None or operation.status == OperationStatus.COMPLETED:
-                return
-            operation.status, operation.completed_at = OperationStatus.FAILED, now
-            account = session.get(AccountRow, operation.account_id)
-            rental = session.get(RentalRow, operation.rental_id) if operation.rental_id else None
-            if account:
-                self._transition_account(session, account, AccountStatus.MANUAL_REVIEW, now)
-            if rental:
-                self._transition_rental(rental, RentalStatus.MANUAL_REVIEW, now)
-            self._audit(
-                session,
-                "OPERATION_FAILED",
-                operation.account_id,
-                operation.rental_id,
-                operation.idempotency_key,
-                now,
+                return False
+            operation.status, operation.completed_at, operation.recovery_claim_token = OperationStatus.FAILED, now, None
+            return self._fail_operation_row(session, operation, now)
+
+    def fail_recovery_operation(
+        self, operation_id: str, recovery_claim_token: str, now: datetime
+    ) -> bool:
+        """Fail recovery only while this worker still owns its durable lease."""
+        with self.db.session() as session, session.begin():
+            changed = session.execute(
+                update(OperationRow)
+                .where(
+                    OperationRow.id == operation_id,
+                    OperationRow.status == OperationStatus.RUNNING,
+                    OperationRow.recovery_claim_token == recovery_claim_token,
+                )
+                .values(status=OperationStatus.FAILED, completed_at=now, recovery_claim_token=None)
             )
+            if (getattr(changed, "rowcount", 0) or 0) != 1:
+                return False
+            operation = session.get(OperationRow, operation_id)
+            assert operation is not None
+            return self._fail_operation_row(session, operation, now)
 
     def expire_due(self, now: datetime) -> int:
         with self.db.session() as session, session.begin():
@@ -386,7 +518,14 @@ class Repository:
                     select(OperationRow)
                     .where(
                         OperationRow.account_id == account.id,
-                        OperationRow.status == OperationStatus.PENDING,
+                        (
+                            (OperationRow.status == OperationStatus.PENDING)
+                            | (
+                                (OperationRow.status == OperationStatus.RUNNING)
+                                & OperationRow.kind.in_([OperationKind.REVOKE_SESSIONS, OperationKind.ROTATE_PASSWORD])
+                                & OperationRow.security_state.in_(["WAITING_LOGIN_OTP", "WAITING_PASSWORD_CHANGE_EMAIL", "INIT", "PENDING_READY", "REMOTE_VERIFIED", "SECRET_PROMOTED"])
+                            )
+                        ),
                     )
                     .limit(1)
                 )
@@ -498,6 +637,9 @@ class Repository:
             )
             self._transition_account(session, account, AccountStatus.SECURITY_ALERT, now)
             self._transition_rental(rental, RentalStatus.SECURITY_TERMINATED, now)
+            # The durable security recovery intent is created in the same
+            # transaction as the alert; lots intentionally remain disabled.
+            self._operation(session, OperationKind.REVOKE_SESSIONS, account.id, rental.id, now)
             self._audit(session, "EMAIL_SECURITY_ALERT", account_id, rental.id, correlation_id, now)
             return True
 
@@ -512,6 +654,73 @@ class Repository:
             row = session.get(RentalRow, rental_id)
             assert row is not None
             return row
+
+    def get_operation(self, operation_id: str) -> OperationRow:
+        with self.db.session() as session:
+            row = session.get(OperationRow, operation_id)
+            assert row is not None
+            return row
+
+    def _external_wait_deadline(self, operation: OperationRow) -> datetime | None:
+        if operation.security_state == "WAITING_LOGIN_OTP" and operation.maintenance_login_requested_at:
+            return operation.maintenance_login_requested_at + timedelta(
+                seconds=self._maintenance_otp_correlation_seconds
+            )
+        if (
+            operation.security_state == "WAITING_PASSWORD_CHANGE_EMAIL"
+            and operation.password_change_requested_at
+        ):
+            return operation.password_change_requested_at + timedelta(
+                seconds=self._password_change_correlation_seconds
+            )
+        return None
+
+    def _complete_operation_row(self, session: Session, op: OperationRow, now: datetime) -> bool:
+        rental = session.get(RentalRow, op.rental_id) if op.rental_id else None
+        account = session.get(AccountRow, op.account_id)
+        if account is None:
+            return False
+        if op.kind == OperationKind.DISABLE_LOTS and rental:
+            self._operation(session, OperationKind.SEND_CREDENTIALS, account.id, rental.id, now)
+        elif op.kind == OperationKind.SEND_CREDENTIALS and rental:
+            self._transition_rental(rental, RentalStatus.ACTIVE, now)
+            rental.started_at = now
+            order = session.get(OrderRow, rental.order_id)
+            if order:
+                rental.expires_at = now + timedelta(seconds=order.duration_seconds)
+                order.fulfillment_status = FulfillmentStatus.ACTIVATED
+            self._transition_account(session, account, AccountStatus.ACTIVE, now)
+            self._audit(session, "RENTAL_STARTED", account.id, rental.id, op.idempotency_key, now)
+        elif op.kind == OperationKind.REVOKE_SESSIONS and rental:
+            self._transition_account(session, account, AccountStatus.ROTATING_PASSWORD, now)
+            self._transition_rental(rental, RentalStatus.PASSWORD_ROTATION, now)
+            self._operation(session, OperationKind.ROTATE_PASSWORD, account.id, rental.id, now)
+        elif op.kind == OperationKind.ROTATE_PASSWORD and rental:
+            self._transition_account(session, account, AccountStatus.AVAILABLE_OFFLINE, now)
+            account.credential_version += 1
+            self._operation(session, OperationKind.ENABLE_LOTS, account.id, rental.id, now)
+        elif op.kind == OperationKind.ENABLE_LOTS and rental:
+            self._transition_account(session, account, AccountStatus.AVAILABLE, now)
+            self._transition_rental(rental, RentalStatus.FINISHED, now)
+            self._audit(session, "RENTAL_FINISHED", account.id, rental.id, op.idempotency_key, now)
+        return True
+
+    def _fail_operation_row(self, session: Session, operation: OperationRow, now: datetime) -> bool:
+        account = session.get(AccountRow, operation.account_id)
+        rental = session.get(RentalRow, operation.rental_id) if operation.rental_id else None
+        if account:
+            self._transition_account(session, account, AccountStatus.MANUAL_REVIEW, now)
+        if rental:
+            self._transition_rental(rental, RentalStatus.MANUAL_REVIEW, now)
+        self._audit(
+            session,
+            "OPERATION_FAILED",
+            operation.account_id,
+            operation.rental_id,
+            operation.idempotency_key,
+            now,
+        )
+        return True
 
     @staticmethod
     def _transition_rental(rental: RentalRow, target: RentalStatus, now: datetime) -> None:

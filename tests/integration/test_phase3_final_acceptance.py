@@ -3,13 +3,11 @@ from datetime import timedelta
 from app.adapters.fake import (
     FakeFunPayAdapter,
     FakeFunPayTransport,
-    FakeGaijinController,
     FakeOwnerNotifier,
     FakeSecureStore,
 )
 from app.adapters.session_backed_funpay import SessionBackedFunPayAdapter
 from app.application.funpay_dispatcher import FunPayEventPoller
-from app.application.rental_manager import RentalManager
 from app.domain.funpay import FunPayHealth
 from app.domain.models import OrderInput
 from app.domain.states import AccountStatus, RentalStatus
@@ -17,7 +15,7 @@ from app.main import create_application
 from app.persistence.database import Database
 from app.persistence.funpay_events import FunPayEventRepository
 from app.persistence.repositories import Repository
-from tests.helpers import create_test_account
+from tests.helpers import create_pixelstorm_manager, create_test_account
 
 
 def test_missing_secure_credentials_never_activates_rental(core, now):
@@ -26,7 +24,7 @@ def test_missing_secure_credentials_never_activates_rental(core, now):
     account_id = repository.add_account("WT01", now)
     repository.add_account_lot(account_id, "missing-credential-lot", now)
     funpay.set_lot_state("missing-credential-lot", enabled=True)
-    manager = RentalManager(repository, funpay, FakeGaijinController(), FakeSecureStore(), owner_notifier=notifier)
+    manager = create_pixelstorm_manager(repository, funpay, FakeSecureStore(), notifier=notifier)
     started = manager.accept_order(OrderInput("missing-credentials", "buyer", "1H", 60), now)
     manager.run_operations(now)
     manager.run_operations(now)
@@ -44,7 +42,7 @@ def test_application_startup_immediately_recovers_running_disable_lots(tmp_path,
     repository = Repository(database)
     external = FakeFunPayAdapter()
     account_id = create_test_account(repository, external, "WT01", now)
-    manager = RentalManager(repository, external, FakeGaijinController(), FakeSecureStore())
+    manager = create_pixelstorm_manager(repository, external, FakeSecureStore())
     manager.secrets.set_current_credentials(account_id, "safe-login", "safe-password")
     manager.accept_order(OrderInput("startup-disable", "buyer", "1H", 60), now)
     operation = repository.pending_operations()[0]
@@ -72,7 +70,7 @@ def test_application_startup_immediately_recovers_running_enable_lots(tmp_path, 
     account_id = create_test_account(repository, external, "WT01", now)
     secrets = FakeSecureStore()
     secrets.set_current_credentials(account_id, "safe-login", "safe-password")
-    manager = RentalManager(repository, external, FakeGaijinController(), secrets)
+    manager = create_pixelstorm_manager(repository, external, secrets)
     manager.accept_order(OrderInput("startup-enable", "buyer", "1H", 1), now)
     manager.run_operations(now)
     manager.run_operations(now)
@@ -100,7 +98,7 @@ def test_startup_lot_failure_notifies_owner_and_polling_notifies_auth_loss(core,
     account_id = create_test_account(repository, funpay, "WT01", now)
     repository.add_account_lot(account_id, "startup-notification-lot", now)
     funpay.set_lot_state("startup-notification-lot", enabled=True)
-    manager = RentalManager(repository, funpay, FakeGaijinController(), FakeSecureStore(), owner_notifier=notifier)
+    manager = create_pixelstorm_manager(repository, funpay, FakeSecureStore(), notifier=notifier)
     manager.accept_order(OrderInput("partial", "buyer", "1H", 60), now)
     operation = repository.pending_operations()[0]
     assert repository.claim_operation(operation.id, now) is not None

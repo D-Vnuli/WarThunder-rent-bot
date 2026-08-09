@@ -9,7 +9,7 @@ from app.domain.models import OrderInput
 from app.domain.states import AccountStatus, FulfillmentStatus
 from app.persistence.database import Database
 from app.persistence.repositories import Repository
-from tests.helpers import create_test_account
+from tests.helpers import create_test_account, fake_pixelstorm_security
 
 
 def _manager(path: Path):
@@ -18,7 +18,7 @@ def _manager(path: Path):
     repo = Repository(db)
     secrets = FakeSecureStore()
     repo._test_secret_store = secrets  # type: ignore[attr-defined]
-    manager = RentalManager(repo, FakeFunPayAdapter(), FakeGaijinController(), secrets)
+    manager = RentalManager(repo, FakeFunPayAdapter(), FakeGaijinController(), secrets, pixelstorm_security=fake_pixelstorm_security(repo, secrets))
     return repo, manager
 
 

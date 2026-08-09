@@ -13,7 +13,7 @@ from app.domain.states import AccountStatus, OperationKind
 from app.persistence.database import Database
 from app.persistence.models import OperationRow
 from app.persistence.repositories import Repository
-from tests.helpers import create_test_account
+from tests.helpers import create_test_account, fake_pixelstorm_security
 
 
 def _new_worker(path, now, lot_states):
@@ -22,7 +22,8 @@ def _new_worker(path, now, lot_states):
     funpay = FakeFunPayAdapter()
     for lot_id, enabled in lot_states.items():
         funpay.set_lot_state(lot_id, enabled=enabled)
-    manager = RentalManager(repository, funpay, FakeGaijinController(), FakeSecureStore())
+    secrets = FakeSecureStore()
+    manager = RentalManager(repository, funpay, FakeGaijinController(), secrets, pixelstorm_security=fake_pixelstorm_security(repository, secrets))
     return repository, manager, funpay
 
 
@@ -35,7 +36,8 @@ def test_disable_lots_crash_restart_verified_state_completes_without_resend(tmp_
     account_id = create_test_account(repository, external, "WT01", now)
     repository.add_account_lot(account_id, f"test-lot-2-{account_id}", now)
     external.set_lot_state(f"test-lot-2-{account_id}", enabled=True)
-    RentalManager(repository, external, FakeGaijinController(), FakeSecureStore()).accept_order(OrderInput("disable", "buyer", "1H", 60), now)
+    secrets = FakeSecureStore()
+    RentalManager(repository, external, FakeGaijinController(), secrets, pixelstorm_security=fake_pixelstorm_security(repository, secrets)).accept_order(OrderInput("disable", "buyer", "1H", 60), now)
     operation = repository.pending_operations()[0]
     assert repository.claim_operation(operation.id, now) is not None
     lots = repository.account_lot_ids(account_id)
@@ -57,7 +59,8 @@ def test_disable_lots_crash_restart_partial_goes_manual_review(tmp_path, now):
     account_id = create_test_account(repository, external, "WT01", now)
     repository.add_account_lot(account_id, f"test-lot-2-{account_id}", now)
     external.set_lot_state(f"test-lot-2-{account_id}", enabled=True)
-    RentalManager(repository, external, FakeGaijinController(), FakeSecureStore()).accept_order(OrderInput("partial", "buyer", "1H", 60), now)
+    secrets = FakeSecureStore()
+    RentalManager(repository, external, FakeGaijinController(), secrets, pixelstorm_security=fake_pixelstorm_security(repository, secrets)).accept_order(OrderInput("partial", "buyer", "1H", 60), now)
     operation = repository.pending_operations()[0]
     assert repository.claim_operation(operation.id, now) is not None
     lots = repository.account_lot_ids(account_id)
@@ -78,7 +81,7 @@ def _running_enable_operation(tmp_path, now):
     account_id = create_test_account(repository, funpay, "WT01", now)
     secrets = FakeSecureStore()
     secrets.set_current_credentials(account_id, "safe-login", "safe-password")
-    manager = RentalManager(repository, funpay, FakeGaijinController(), secrets)
+    manager = RentalManager(repository, funpay, FakeGaijinController(), secrets, pixelstorm_security=fake_pixelstorm_security(repository, secrets))
     manager.accept_order(OrderInput("enable", "buyer", "1H", 1), now)
     manager.run_operations(now)
     manager.run_operations(now)
@@ -120,7 +123,7 @@ def test_startup_reconciliation_recovers_send_credentials_receipt(tmp_path, now)
     account_id = create_test_account(repository, funpay, "WT01", now)
     secrets = FakeSecureStore()
     secrets.set_current_credentials(account_id, "safe-login", "safe-password")
-    manager = RentalManager(repository, funpay, FakeGaijinController(), secrets)
+    manager = RentalManager(repository, funpay, FakeGaijinController(), secrets, pixelstorm_security=fake_pixelstorm_security(repository, secrets))
     started = manager.accept_order(OrderInput("credentials", "buyer", "1H", 60), now)
     manager.run_operations(now)
     operation = repository.pending_operations()[0]
@@ -143,7 +146,8 @@ def test_startup_reconciliation_recovers_send_otp_receipt(tmp_path, now):
     repository = Repository(database)
     funpay = FakeFunPayAdapter(backend)
     account_id = create_test_account(repository, funpay, "WT01", now)
-    manager = RentalManager(repository, funpay, FakeGaijinController(), FakeSecureStore())
+    secrets = FakeSecureStore()
+    manager = RentalManager(repository, funpay, FakeGaijinController(), secrets, pixelstorm_security=fake_pixelstorm_security(repository, secrets))
     started = manager.accept_order(OrderInput("otp", "buyer", "1H", 60), now)
     manager.run_operations(now)
     manager.run_operations(now)

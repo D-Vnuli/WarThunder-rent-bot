@@ -23,4 +23,4 @@ def test_full_fake_lifecycle(core, now):
     assert repository.get_account(account_id).status == AccountStatus.AVAILABLE
     assert repository.get_rental(rental.id).status == RentalStatus.FINISHED
     assert funpay.lots_enabled
-    assert gaijin.revoked == [account_id]
+    assert gaijin.revoked == []

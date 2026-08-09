@@ -39,8 +39,10 @@ class SecurityEventClaim:
 
 
 class ClassifiedEmailRepository:
-    def __init__(self, database: Database) -> None:
+    def __init__(self, database: Database, password_change_correlation_seconds: int = 900, maintenance_otp_correlation_seconds: int = 300) -> None:
         self.db = database
+        self._password_change_correlation_seconds = password_change_correlation_seconds
+        self._maintenance_otp_correlation_seconds = maintenance_otp_correlation_seconds
 
     def store_event(self, event: ClassifiedEmailEvent, now: datetime) -> bool:
         """Atomically publish metadata and Gmail ingestion ledger; no payload enters SQLite."""
@@ -85,8 +87,10 @@ class ClassifiedEmailRepository:
                         OperationRow.account_id == account_id,
                         OperationRow.kind == OperationKind.ROTATE_PASSWORD,
                         OperationRow.status == OperationStatus.RUNNING,
-                        OperationRow.started_at.is_not(None),
-                        OperationRow.started_at <= received_at,
+                        OperationRow.password_change_requested_at.is_not(None),
+                        OperationRow.password_change_requested_at <= received_at,
+                        OperationRow.password_change_requested_at
+                        >= received_at - timedelta(seconds=self._password_change_correlation_seconds),
                     )
                 )
             )
@@ -235,6 +239,50 @@ class ClassifiedEmailRepository:
             session.add(request)
             session.flush()
             return EmailClaim(event.id, claim_token, request.id)
+
+    def claim_maintenance_login_otp(
+        self, account_id: str, operation_id: str, login_requested_at: datetime, now: datetime
+    ) -> EmailClaim | None:
+        """Claim a fresh maintenance OTP without touching buyer-rental OTPs."""
+        with self.db.session() as session, session.begin():
+            operation = session.get(OperationRow, operation_id)
+            if (
+                operation is None
+                or operation.account_id != account_id
+                or operation.status != OperationStatus.RUNNING
+                or operation.kind
+                not in {OperationKind.REVOKE_SESSIONS, OperationKind.ROTATE_PASSWORD}
+            ):
+                return None
+            event = session.scalar(
+                select(ClassifiedEmailEventRow)
+                .where(
+                    ClassifiedEmailEventRow.message_type == EmailMessageType.LOGIN_OTP,
+                    ClassifiedEmailEventRow.routing_account_id == account_id,
+                    ClassifiedEmailEventRow.claim_token.is_(None),
+                    ClassifiedEmailEventRow.payload_state == EmailPayloadState.AVAILABLE,
+                    ClassifiedEmailEventRow.received_at >= login_requested_at,
+                    ClassifiedEmailEventRow.received_at <= now,
+                    ClassifiedEmailEventRow.received_at <= login_requested_at + timedelta(seconds=self._maintenance_otp_correlation_seconds),
+                )
+                .order_by(ClassifiedEmailEventRow.received_at)
+                .limit(1)
+            )
+            if event is None:
+                return None
+            token = str(uuid4())
+            claimed = session.execute(
+                update(ClassifiedEmailEventRow)
+                .where(
+                    ClassifiedEmailEventRow.id == event.id,
+                    ClassifiedEmailEventRow.claim_token.is_(None),
+                    ClassifiedEmailEventRow.payload_state == EmailPayloadState.AVAILABLE,
+                )
+                .values(claim_token=token, claimed_by="pixelstorm_maintenance", claimed_at=now)
+            )
+            if (getattr(claimed, "rowcount", 0) or 0) != 1:
+                return None
+            return EmailClaim(event.id, token)
 
     def claim_expected_password_change(
         self, rotation_operation_id: str, now: datetime

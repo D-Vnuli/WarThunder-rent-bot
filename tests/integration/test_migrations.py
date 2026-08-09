@@ -37,6 +37,23 @@ def test_phase2_upgrade_and_downgrade_preserve_phase1_schema(tmp_path):
     assert {"accounts", "orders", "rentals", "operations", "audit_events"} <= tables
     assert "classified_email_events" not in tables
     subprocess.run([*command, "upgrade", "head"], check=True, env=environment)
+
+
+def test_phase4_0005_upgrade_downgrade_upgrade(tmp_path):
+    database = tmp_path / "phase4-migration.db"
+    environment = {**os.environ, "DATABASE_URL": f"sqlite:///{database.as_posix()}"}
+    command = [sys.executable, "-m", "alembic", "-c", "alembic.ini"]
+    subprocess.run([*command, "upgrade", "0004_phase3_funpay"], check=True, env=environment)
+    subprocess.run([*command, "upgrade", "0005_phase4_pixelstorm"], check=True, env=environment)
+    with sqlite3.connect(database) as connection:
+        columns = {row[1] for row in connection.execute("pragma table_info(operations)")}
+    assert {"maintenance_login_requested_at", "password_change_requested_at", "security_state", "recovery_claim_token"} <= columns
+    subprocess.run([*command, "downgrade", "0004_phase3_funpay"], check=True, env=environment)
+    with sqlite3.connect(database) as connection:
+        columns = {row[1] for row in connection.execute("pragma table_info(operations)")}
+    assert "maintenance_login_requested_at" not in columns
+    assert "password_change_requested_at" not in columns
+    subprocess.run([*command, "upgrade", "head"], check=True, env=environment)
     with sqlite3.connect(database) as connection:
         columns = {
             row[1]

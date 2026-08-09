@@ -28,11 +28,11 @@ def test_unverified_disable_lots_enters_manual_review(core, now):
 
 def test_expiration_uses_persisted_timestamp(core, now):
     repository, manager, funpay, gaijin = core
-    account_id = create_test_account(repository, funpay, "WT01", now)
+    create_test_account(repository, funpay, "WT01", now)
     rental = manager.accept_order(OrderInput("A", "buyer-a", "1H", 60), now)
     manager.run_operations(now)
     manager.run_operations(now)
     DurableScheduler(repository, manager).tick(now + timedelta(seconds=61))
     manager.run_operations(now + timedelta(seconds=61))
-    assert gaijin.revoked == [account_id]
+    assert gaijin.revoked == []
     assert repository.get_rental(rental.rental_id or "").status == RentalStatus.PASSWORD_ROTATION

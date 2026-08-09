@@ -9,6 +9,9 @@ class Settings(BaseSettings):
     otp_min_request_interval_seconds: int = 30
     email_secret_ttl_seconds: int = 300
     password_reset_ttl_seconds: int = 900
+    pixelstorm_password_change_correlation_seconds: int = 900
+    live_pixelstorm_enabled: bool = False
+    live_pixelstorm_destructive_confirmed: bool = False
     gmail_oauth_client_id: str | None = None
     gmail_allowed_sender: str | None = None
 

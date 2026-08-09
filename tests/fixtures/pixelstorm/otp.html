@@ -1,0 +1,5 @@
+<!-- SYNTHETIC CONTRACT FIXTURE: no real Pixel Storm HTML or data. -->
+<main data-pixelstorm-page="otp" data-pixelstorm-otp-state="pending">
+  <label>One-time code <input data-pixelstorm-otp></label>
+  <button data-pixelstorm-otp-submit onclick="this.closest('main').dataset.pixelstormPage=this.previousElementSibling.querySelector('input').value==='synthetic-otp'?'authenticated':'otp';this.closest('main').dataset.pixelstormOtpState=this.closest('main').dataset.pixelstormPage==='authenticated'?'accepted':'rejected'">Submit OTP</button>
+</main>
