@@ -126,8 +126,9 @@ def test_crash_after_credentials_send_is_fail_closed_without_second_send(tmp_pat
     manager.accept_order(OrderInput("order", "buyer", "1H", 60), now)
     manager.run_operations(now)  # disable lots -> durable SEND_CREDENTIALS
     operation = repo.pending_operations()[0]
+    operation = repo.claim_operation(operation.id, now)
+    assert operation is not None
     assert manager._send_credentials(operation, now)  # external success, no DB completion
-    assert repo.claim_operation(operation.id, now) is not None
     assert StartupReconciliation(repo).run(now + timedelta(seconds=31)) == 1
     assert manager.funpay.message_send_count == 1
 

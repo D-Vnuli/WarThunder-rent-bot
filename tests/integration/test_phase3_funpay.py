@@ -194,9 +194,11 @@ def test_paid_event_survives_dispatcher_restart_and_credentials_do_not_duplicate
     assert dispatcher.dispatch_pending(now) == 1
     manager.run_operations(now)  # verified DISABLE_LOTS creates SEND_CREDENTIALS
     send = repository.pending_operations()[0]
+    send = repository.claim_operation(send.id, now)
+    assert send is not None
     assert manager._send_credentials(send, now)
     # Simulated crash after external success: fake external state has the idempotent receipt.
-    manager.run_operations(now)
+    assert repository.operation_completed(send.id, now, normal_claim_token=send.normal_claim_token)
     assert funpay.message_send_count == 1
     assert repository.pending_operations() == []
 
@@ -232,7 +234,8 @@ def test_send_credentials_crash_restart_with_new_worker(tmp_path, now):
     result = manager1.accept_order(OrderInput("crash-credentials", "buyer", "1H", 3600), now)
     manager1.run_operations(now)
     operation = repo1.pending_operations()[0]
-    assert repo1.claim_operation(operation.id, now) is not None
+    operation = repo1.claim_operation(operation.id, now)
+    assert operation is not None
     assert manager1._send_credentials(operation, now)  # external success, then crash before completion
     assert backend.send_count(operation.idempotency_key) == 1
 
@@ -240,7 +243,7 @@ def test_send_credentials_crash_restart_with_new_worker(tmp_path, now):
     funpay2 = FakeFunPayAdapter(backend)
     manager2 = RentalManager(Repository(db2), funpay2, FakeGaijinController(), FakeSecureStore())
     assert funpay1 is not funpay2
-    assert manager2.recover_message_receipts(now) == 1
+    assert manager2.recover_message_receipts(now + timedelta(seconds=31)) == 1
     assert backend.send_count(operation.idempotency_key) == 1
     assert Repository(db2).get_rental(result.rental_id or "").status == "ACTIVE"
 
@@ -267,12 +270,13 @@ def test_send_otp_crash_restart_with_new_worker(tmp_path, now):
     dispatcher = FunPayEventDispatcher(events, manager, OTPService(emails, secrets, 120, 0), funpay1)
     dispatcher.dispatch_pending(now)
     op = repo1.pending_operations()[0]
-    assert repo1.claim_operation(op.id, now) is not None
+    op = repo1.claim_operation(op.id, now)
+    assert op is not None
     worker1 = RentalManager(repo1, funpay1, FakeGaijinController(), FakeSecureStore(), otp_service=OTPService(emails, secrets, 120, 0))
     assert worker1._send_otp(op, now)
     db2 = Database(f"sqlite:///{path.as_posix()}")
     funpay2 = FakeFunPayAdapter(backend)
     worker2 = RentalManager(Repository(db2), funpay2, FakeGaijinController(), FakeSecureStore())
     assert funpay1 is not funpay2
-    assert worker2.recover_message_receipts(now) == 1
+    assert worker2.recover_message_receipts(now + timedelta(seconds=31)) == 1
     assert backend.send_count(op.idempotency_key) == 1

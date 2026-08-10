@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 from time import sleep
 from uuid import uuid4
 
-from sqlalchemy import exists, or_, select, update
+from sqlalchemy import exists, or_, select, true, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
@@ -180,13 +180,14 @@ class Repository:
                 )
             )
 
-    def recoverable_message_operations(self) -> list[OperationRow]:
+    def recoverable_message_operations(self, now: datetime) -> list[OperationRow]:
         with self.db.session() as session:
             return list(
                 session.scalars(
                     select(OperationRow).where(
                         OperationRow.kind.in_([OperationKind.SEND_CREDENTIALS, OperationKind.SEND_OTP]),
                         OperationRow.status == OperationStatus.RUNNING,
+                        or_(OperationRow.lease_until.is_(None), OperationRow.lease_until < now),
                     )
                 )
             )
@@ -280,11 +281,79 @@ class Repository:
                     started_at=now,
                     lease_until=now + timedelta(seconds=lease_seconds),
                     attempt_count=OperationRow.attempt_count + 1,
+                    normal_claim_token=str(uuid4()),
                 )
             )
             if (getattr(claimed, "rowcount", 0) or 0) != 1:
                 return None
             return session.get(OperationRow, operation_id)
+
+    def claim_waiting_security_operation(
+        self, operation_id: str, now: datetime, lease_seconds: int = 30
+    ) -> OperationRow | None:
+        """Assign a fresh normal-worker claim when correlated email work resumes."""
+        with self.db.session() as session, session.begin():
+            claimed = session.execute(
+                update(OperationRow)
+                .where(
+                    OperationRow.id == operation_id,
+                    OperationRow.status == OperationStatus.RUNNING,
+                    OperationRow.normal_claim_token.is_(None),
+                    OperationRow.recovery_claim_token.is_(None),
+                    OperationRow.security_state.in_(
+                        ["WAITING_LOGIN_OTP", "WAITING_PASSWORD_CHANGE_EMAIL"]
+                    ),
+                )
+                .values(
+                    lease_until=now + timedelta(seconds=lease_seconds),
+                    attempt_count=OperationRow.attempt_count + 1,
+                    normal_claim_token=str(uuid4()),
+                )
+            )
+            if (getattr(claimed, "rowcount", 0) or 0) != 1:
+                return None
+            return session.get(OperationRow, operation_id)
+
+    def fence_normal_side_effect(
+        self, operation_id: str, normal_claim_token: str | None, now: datetime, lease_seconds: int = 30
+    ) -> bool:
+        """Renew and verify durable ownership immediately before an external call."""
+        if normal_claim_token is None:
+            return False
+        with self.db.session() as session, session.begin():
+            fenced = session.execute(
+                update(OperationRow)
+                .where(
+                    OperationRow.id == operation_id,
+                    OperationRow.status == OperationStatus.RUNNING,
+                    OperationRow.normal_claim_token == normal_claim_token,
+                    OperationRow.recovery_claim_token.is_(None),
+                    OperationRow.lease_until.is_not(None),
+                    OperationRow.lease_until >= now,
+                )
+                .values(lease_until=now + timedelta(seconds=lease_seconds))
+            )
+            return (getattr(fenced, "rowcount", 0) or 0) == 1
+
+    def fence_recovery_side_effect(
+        self, operation_id: str, recovery_claim_token: str | None, now: datetime
+    ) -> bool:
+        """Verify startup-recovery ownership immediately before an external call."""
+        if recovery_claim_token is None:
+            return False
+        with self.db.session() as session, session.begin():
+            fenced = session.execute(
+                update(OperationRow)
+                .where(
+                    OperationRow.id == operation_id,
+                    OperationRow.status == OperationStatus.RUNNING,
+                    OperationRow.recovery_claim_token == recovery_claim_token,
+                    OperationRow.lease_until.is_not(None),
+                    OperationRow.lease_until >= now,
+                )
+                .values(lease_until=now + timedelta(minutes=5))
+            )
+            return (getattr(fenced, "rowcount", 0) or 0) == 1
 
     def recover_expired_leases(self, now: datetime) -> int:
         """Expired critical work is never blindly retried: quarantine it fail-closed."""
@@ -328,7 +397,12 @@ class Repository:
                             else OperationRow.lease_until < now
                         ),
                     )
-                    .values(status=OperationStatus.FAILED, completed_at=now, lease_until=None)
+                    .values(
+                        status=OperationStatus.FAILED,
+                        completed_at=now,
+                        lease_until=None,
+                        normal_claim_token=None,
+                    )
                 )
                 if (getattr(claimed, "rowcount", 0) or 0) != 1:
                     continue
@@ -404,20 +478,69 @@ class Repository:
                         if state in {"WAITING_LOGIN_OTP", "WAITING_PASSWORD_CHANGE_EMAIL"}
                         else now + timedelta(minutes=5)
                     ),
+                    normal_claim_token=(
+                        None
+                        if state in {"WAITING_LOGIN_OTP", "WAITING_PASSWORD_CHANGE_EMAIL"}
+                        else OperationRow.normal_claim_token
+                    ),
+                )
+            )
+            return (getattr(changed, "rowcount", 0) or 0) == 1
+
+    def wait_for_buyer_otp(self, operation_id: str, now: datetime) -> bool:
+        """Release a buyer-OTP delivery intent until Gmail supplies its secret."""
+        with self.db.session() as session, session.begin():
+            changed = session.execute(
+                update(OperationRow)
+                .where(
+                    OperationRow.id == operation_id,
+                    OperationRow.status == OperationStatus.RUNNING,
+                    OperationRow.kind == OperationKind.SEND_OTP,
+                )
+                .values(
+                    status=OperationStatus.PENDING,
+                    security_state="WAITING_BUYER_OTP",
+                    lease_until=None,
+                    normal_claim_token=None,
+                    completed_at=None,
                 )
             )
             return (getattr(changed, "rowcount", 0) or 0) == 1
 
     def operation_completed(
-        self, operation_id: str, now: datetime, recovery_claim_token: str | None = None
+        self,
+        operation_id: str,
+        now: datetime,
+        recovery_claim_token: str | None = None,
+        normal_claim_token: str | None = None,
     ) -> bool:
         if recovery_claim_token is not None:
             return self.complete_recovery_operation(operation_id, recovery_claim_token, now)
         with self.db.session() as session, session.begin():
-            op = session.get(OperationRow, operation_id)
-            if op is None or op.status == OperationStatus.COMPLETED:
+            claimed = session.execute(
+                update(OperationRow)
+                .where(
+                    OperationRow.id == operation_id,
+                    OperationRow.status == OperationStatus.RUNNING,
+                    OperationRow.recovery_claim_token.is_(None),
+                    (
+                        OperationRow.normal_claim_token == normal_claim_token
+                        if normal_claim_token is not None
+                        else true()
+                    ),
+                )
+                .values(
+                    status=OperationStatus.COMPLETED,
+                    completed_at=now,
+                    lease_until=None,
+                    normal_claim_token=None,
+                    recovery_claim_token=None,
+                )
+            )
+            if (getattr(claimed, "rowcount", 0) or 0) != 1:
                 return False
-            op.status, op.completed_at, op.lease_until, op.recovery_claim_token = OperationStatus.COMPLETED, now, None, None
+            op = session.get(OperationRow, operation_id)
+            assert op is not None
             return self._complete_operation_row(session, op, now)
 
     def complete_recovery_operation(
@@ -446,15 +569,39 @@ class Repository:
             return self._complete_operation_row(session, operation, now)
 
     def operation_failed(
-        self, operation_id: str, now: datetime, recovery_claim_token: str | None = None
+        self,
+        operation_id: str,
+        now: datetime,
+        recovery_claim_token: str | None = None,
+        normal_claim_token: str | None = None,
     ) -> bool:
         if recovery_claim_token is not None:
             return self.fail_recovery_operation(operation_id, recovery_claim_token, now)
         with self.db.session() as session, session.begin():
-            operation = session.get(OperationRow, operation_id)
-            if operation is None or operation.status == OperationStatus.COMPLETED:
+            changed = session.execute(
+                update(OperationRow)
+                .where(
+                    OperationRow.id == operation_id,
+                    OperationRow.status == OperationStatus.RUNNING,
+                    OperationRow.recovery_claim_token.is_(None),
+                    (
+                        OperationRow.normal_claim_token == normal_claim_token
+                        if normal_claim_token is not None
+                        else true()
+                    ),
+                )
+                .values(
+                    status=OperationStatus.FAILED,
+                    completed_at=now,
+                    lease_until=None,
+                    normal_claim_token=None,
+                    recovery_claim_token=None,
+                )
+            )
+            if (getattr(changed, "rowcount", 0) or 0) != 1:
                 return False
-            operation.status, operation.completed_at, operation.recovery_claim_token = OperationStatus.FAILED, now, None
+            operation = session.get(OperationRow, operation_id)
+            assert operation is not None
             return self._fail_operation_row(session, operation, now)
 
     def fail_recovery_operation(
@@ -481,20 +628,33 @@ class Repository:
         with self.db.session() as session, session.begin():
             due = list(
                 session.scalars(
-                    select(RentalRow).where(
+                    select(RentalRow.id).where(
                         RentalRow.status == RentalStatus.ACTIVE, RentalRow.expires_at <= now
                     )
                 )
             )
-            for rental in due:
+            expired = 0
+            for rental_id in due:
+                # The conditional write is the durable expiry claim.  A second
+                # scheduler can observe the same due row, but cannot transition
+                # it (or create another revoke operation) after this succeeds.
+                claimed = session.execute(
+                    update(RentalRow)
+                    .where(RentalRow.id == rental_id, RentalRow.status == RentalStatus.ACTIVE)
+                    .values(status=RentalStatus.EXPIRING, updated_at=now)
+                )
+                if (getattr(claimed, "rowcount", 0) or 0) != 1:
+                    continue
+                rental = session.get(RentalRow, rental_id)
+                assert rental is not None
                 account = session.get(AccountRow, rental.account_id)
-                if account is None:
+                if account is None or account.status != AccountStatus.ACTIVE:
                     continue
                 self._transition_account(session, account, AccountStatus.EXPIRING, now)
-                self._transition_rental(rental, RentalStatus.EXPIRING, now)
                 self._operation(session, OperationKind.REVOKE_SESSIONS, account.id, rental.id, now)
                 self._audit(session, "RENTAL_EXPIRED", account.id, rental.id, rental.id, now)
-            return len(due)
+                expired += 1
+            return expired
 
     def reconcile(self, now: datetime) -> int:
         with self.db.session() as session, session.begin():
@@ -518,14 +678,7 @@ class Repository:
                     select(OperationRow)
                     .where(
                         OperationRow.account_id == account.id,
-                        (
-                            (OperationRow.status == OperationStatus.PENDING)
-                            | (
-                                (OperationRow.status == OperationStatus.RUNNING)
-                                & OperationRow.kind.in_([OperationKind.REVOKE_SESSIONS, OperationKind.ROTATE_PASSWORD])
-                                & OperationRow.security_state.in_(["WAITING_LOGIN_OTP", "WAITING_PASSWORD_CHANGE_EMAIL", "INIT", "PENDING_READY", "REMOTE_VERIFIED", "SECRET_PROMOTED"])
-                            )
-                        ),
+                        OperationRow.status.in_([OperationStatus.PENDING, OperationStatus.RUNNING]),
                     )
                     .limit(1)
                 )

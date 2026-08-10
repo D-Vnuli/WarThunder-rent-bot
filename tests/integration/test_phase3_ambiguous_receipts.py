@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from app.adapters.fake import FakeGaijinController, FakeOwnerNotifier, FakeSecureStore
 from app.application.rental_manager import RentalManager
 from app.application.startup_reconciliation import StartupReconciliation
@@ -17,11 +19,12 @@ def test_send_credentials_ambiguous_receipt_never_resends_and_notifies_owner(cor
     manager.accept_order(OrderInput("credentials", "buyer", "1H", 60), now)
     manager.run_operations(now)
     operation = repository.pending_operations()[0]
-    assert repository.claim_operation(operation.id, now) is not None
+    operation = repository.claim_operation(operation.id, now)
+    assert operation is not None
     funpay.fail_next.add("message_ambiguous")
     assert not manager._send_credentials(operation, now)
     assert funpay.message_send_count == 1
-    StartupReconciliation(repository, manager, funpay).run(now)
+    StartupReconciliation(repository, manager, funpay).run(now + timedelta(seconds=31))
     assert funpay.message_send_count == 1
     assert repository.get_account(account_id).status == AccountStatus.MANUAL_REVIEW
     assert any(item.category == "SEND_CREDENTIALS_AMBIGUOUS" for item in notifier.notifications)
@@ -58,7 +61,7 @@ def test_send_otp_ambiguous_receipt_never_resends_and_notifies_owner(core, now):
     before = funpay.message_send_count
     funpay.send_message("buyer", "654321", idempotency_key="SEND_OTP:ambiguous", now=now)
     assert funpay.message_send_count == before + 1
-    StartupReconciliation(repository, manager, funpay).run(now)
+    StartupReconciliation(repository, manager, funpay).run(now + timedelta(seconds=31))
     assert funpay.message_send_count == before + 1
     assert repository.get_rental(rental.id).status == RentalStatus.MANUAL_REVIEW
     assert any(item.category == "SEND_OTP_AMBIGUOUS" for item in notifier.notifications)

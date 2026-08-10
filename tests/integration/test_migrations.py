@@ -88,3 +88,29 @@ def test_phase4_0005_upgrade_downgrade_upgrade(tmp_path):
         }
     assert "accounts" not in tables
     subprocess.run([*command, "upgrade", "head"], check=True, env=environment)
+
+
+def test_phase5_0006_normal_worker_fencing_upgrade_downgrade_upgrade(tmp_path):
+    database = tmp_path / "phase5-fencing-migration.db"
+    environment = {**os.environ, "DATABASE_URL": f"sqlite:///{database.as_posix()}"}
+    command = [sys.executable, "-m", "alembic", "-c", "alembic.ini"]
+    subprocess.run([*command, "upgrade", "0005_phase4_pixelstorm"], check=True, env=environment)
+    with sqlite3.connect(database) as connection:
+        assert "normal_claim_token" not in {
+            row[1] for row in connection.execute("pragma table_info(operations)")
+        }
+    subprocess.run([*command, "upgrade", "0006_phase5_normal_worker_fencing"], check=True, env=environment)
+    with sqlite3.connect(database) as connection:
+        assert "normal_claim_token" in {
+            row[1] for row in connection.execute("pragma table_info(operations)")
+        }
+    subprocess.run([*command, "downgrade", "0005_phase4_pixelstorm"], check=True, env=environment)
+    with sqlite3.connect(database) as connection:
+        assert "normal_claim_token" not in {
+            row[1] for row in connection.execute("pragma table_info(operations)")
+        }
+    subprocess.run([*command, "upgrade", "head"], check=True, env=environment)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+            "0006_phase5_normal_worker_fencing",
+        )

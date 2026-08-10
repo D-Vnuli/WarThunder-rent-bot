@@ -2,6 +2,7 @@
 
 from datetime import datetime
 
+from app.application.lease_guard import Clock, SideEffectLeaseGuard
 from app.application.password_rotator import PasswordRotator
 from app.application.pixelstorm_otp import PixelStormMaintenanceOtpService
 from app.application.pixelstorm_passwords import PixelStormPasswordGenerator
@@ -28,6 +29,8 @@ class PixelStormSecurityService:
         maintenance_otp: PixelStormMaintenanceOtpService | None = None,
         password_generator: PixelStormPasswordGenerator | None = None,
         password_rotator: PasswordRotator | None = None,
+        clock: Clock | None = None,
+        lease_heartbeat_interval_seconds: float = 5.0,
     ) -> None:
         self._pixelstorm = pixelstorm
         self._secrets = secrets
@@ -37,17 +40,62 @@ class PixelStormSecurityService:
         self._passwords = password_generator or PixelStormPasswordGenerator()
         self._password_rotator = password_rotator
         self._waiting_external = False
+        self._clock = clock
+        self._lease_heartbeat_interval_seconds = lease_heartbeat_interval_seconds
 
-    def execute_revoke(self, account_id: str, operation_id: str, now: datetime, *, recovery: bool = False) -> SecurityOperationOutcome:
+    def execute_revoke(
+        self,
+        account_id: str,
+        operation_id: str,
+        now: datetime,
+        *,
+        recovery: bool = False,
+        normal_claim_token: str | None = None,
+        recovery_claim_token: str | None = None,
+    ) -> SecurityOperationOutcome:
         self._waiting_external = False
-        return SecurityOperationOutcome.COMPLETED if self.revoke(account_id, operation_id, now, recovery=recovery) else (SecurityOperationOutcome.WAITING_EXTERNAL if self._waiting_external else SecurityOperationOutcome.FAILED_CLOSED)
+        return SecurityOperationOutcome.COMPLETED if self.revoke(
+            account_id,
+            operation_id,
+            now,
+            recovery=recovery,
+            normal_claim_token=normal_claim_token,
+            recovery_claim_token=recovery_claim_token,
+        ) else (SecurityOperationOutcome.WAITING_EXTERNAL if self._waiting_external else SecurityOperationOutcome.FAILED_CLOSED)
 
-    def execute_rotate(self, account_id: str, operation_id: str, now: datetime, *, recovery: bool = False) -> SecurityOperationOutcome:
+    def execute_rotate(
+        self,
+        account_id: str,
+        operation_id: str,
+        now: datetime,
+        *,
+        recovery: bool = False,
+        normal_claim_token: str | None = None,
+        recovery_claim_token: str | None = None,
+    ) -> SecurityOperationOutcome:
         self._waiting_external = False
-        return SecurityOperationOutcome.COMPLETED if self.rotate(account_id, operation_id, now, recovery=recovery) else (SecurityOperationOutcome.WAITING_EXTERNAL if self._waiting_external else SecurityOperationOutcome.FAILED_CLOSED)
+        return SecurityOperationOutcome.COMPLETED if self.rotate(
+            account_id,
+            operation_id,
+            now,
+            recovery=recovery,
+            normal_claim_token=normal_claim_token,
+            recovery_claim_token=recovery_claim_token,
+        ) else (SecurityOperationOutcome.WAITING_EXTERNAL if self._waiting_external else SecurityOperationOutcome.FAILED_CLOSED)
 
-    def revoke(self, account_id: str, operation_id: str, now: datetime, *, recovery: bool = False) -> bool:
-        if not self._ensure_authenticated(account_id, operation_id, now):
+    def revoke(
+        self,
+        account_id: str,
+        operation_id: str,
+        now: datetime,
+        *,
+        recovery: bool = False,
+        normal_claim_token: str | None = None,
+        recovery_claim_token: str | None = None,
+    ) -> bool:
+        if not self._ensure_authenticated(
+            account_id, operation_id, now, normal_claim_token, recovery_claim_token
+        ):
             return False
         capabilities = self._pixelstorm.inspect_security_capabilities(account_id)
         if capabilities.unknown or not (capabilities.session_revocation_available or capabilities.revoke_all_available):
@@ -59,14 +107,33 @@ class PixelStormSecurityService:
                 return True
             self._notify("SESSION_REVOCATION_AMBIGUOUS", operation_id, account_id, now)
             return False
-        result = self._pixelstorm.revoke_sessions(account_id)
+        owned, result = self._external_side_effect(
+            operation_id,
+            now,
+            normal_claim_token,
+            recovery_claim_token,
+            lambda: self._pixelstorm.revoke_sessions(account_id),
+        )
+        if not owned or result is None:
+            return False
         if result == PixelStormRevocationResult.SUPPORTED_VERIFIED and self._pixelstorm.verify_revocation(account_id) == PixelStormRevocationResult.SUPPORTED_VERIFIED:
             return True
         self._notify("SESSION_REVOCATION_AMBIGUOUS", operation_id, account_id, now)
         return False
 
-    def rotate(self, account_id: str, operation_id: str, now: datetime, *, recovery: bool = False) -> bool:
-        if not self._ensure_authenticated(account_id, operation_id, now):
+    def rotate(
+        self,
+        account_id: str,
+        operation_id: str,
+        now: datetime,
+        *,
+        recovery: bool = False,
+        normal_claim_token: str | None = None,
+        recovery_claim_token: str | None = None,
+    ) -> bool:
+        if not self._ensure_authenticated(
+            account_id, operation_id, now, normal_claim_token, recovery_claim_token
+        ):
             return False
         capabilities = self._pixelstorm.inspect_security_capabilities(account_id)
         if capabilities.unknown or not capabilities.password_change_available:
@@ -86,8 +153,17 @@ class PixelStormSecurityService:
             if reset_url is None:
                 self._wait(operation_id, "WAITING_PASSWORD_CHANGE_EMAIL", now)
                 return False
+            owned, changed = self._external_side_effect(
+                operation_id,
+                now,
+                normal_claim_token,
+                recovery_claim_token,
+                lambda: self._pixelstorm.complete_password_change(account_id, reset_url, pending[1]),
+            )
+            if not owned or changed is None:
+                return False
             return self._finalize_password_change(
-                self._pixelstorm.complete_password_change(account_id, reset_url, pending[1]),
+                changed,
                 account_id,
                 operation_id,
                 now,
@@ -121,7 +197,15 @@ class PixelStormSecurityService:
         ):
             self._wait(operation_id, "WAITING_PASSWORD_CHANGE_EMAIL", now)
             return False
-        requested = self._pixelstorm.request_password_change(account_id, current[0], current[1])
+        owned, requested = self._external_side_effect(
+            operation_id,
+            now,
+            normal_claim_token,
+            recovery_claim_token,
+            lambda: self._pixelstorm.request_password_change(account_id, current[0], current[1]),
+        )
+        if not owned or requested is None:
+            return False
         if requested == PixelStormPasswordChangeResult.CONFIRMATION_REQUIRED:
             if self._password_rotator is None:
                 self._notify("PASSWORD_ROTATION_AMBIGUOUS", operation_id, account_id, now)
@@ -130,9 +214,25 @@ class PixelStormSecurityService:
             if reset_url is None:
                 self._wait(operation_id, "WAITING_PASSWORD_CHANGE_EMAIL", now)
                 return False
-            changed = self._pixelstorm.complete_password_change(account_id, reset_url, pending[1])
+            owned, changed = self._external_side_effect(
+                operation_id,
+                now,
+                normal_claim_token,
+                recovery_claim_token,
+                lambda: self._pixelstorm.complete_password_change(account_id, reset_url, pending[1]),
+            )
+            if not owned or changed is None:
+                return False
         elif requested == PixelStormPasswordChangeResult.VERIFIED:
-            changed = self._pixelstorm.change_password(account_id, current[0], current[1], pending[1])
+            owned, changed = self._external_side_effect(
+                operation_id,
+                now,
+                normal_claim_token,
+                recovery_claim_token,
+                lambda: self._pixelstorm.change_password(account_id, current[0], current[1], pending[1]),
+            )
+            if not owned or changed is None:
+                return False
         else:
             changed = requested
         return self._finalize_password_change(changed, account_id, operation_id, now, pending)
@@ -153,7 +253,14 @@ class PixelStormSecurityService:
         self._set_state(operation_id, "SECRET_PROMOTED", now)
         return True
 
-    def _ensure_authenticated(self, account_id: str, operation_id: str, now: datetime) -> bool:
+    def _ensure_authenticated(
+        self,
+        account_id: str,
+        operation_id: str,
+        now: datetime,
+        normal_claim_token: str | None,
+        recovery_claim_token: str | None,
+    ) -> bool:
         health = self._pixelstorm.health(account_id)
         if health == PixelStormHealth.READY:
             return True
@@ -173,11 +280,22 @@ class PixelStormSecurityService:
             )
             if otp is None:
                 self._waiting_external = True
+                self._wait(operation_id, "WAITING_LOGIN_OTP", now)
                 return False
-            return self._authenticate_once_with_otp(account_id, operation_id, now, credentials, otp)
+            return self._authenticate_once_with_otp(
+                account_id, operation_id, now, credentials, otp, normal_claim_token, recovery_claim_token
+            )
         if self._repository is not None:
             self._repository.record_maintenance_login_requested(operation_id, now)
-        result = self._pixelstorm.authenticate(account_id, *credentials)
+        owned, result = self._external_side_effect(
+            operation_id,
+            now,
+            normal_claim_token,
+            recovery_claim_token,
+            lambda: self._pixelstorm.authenticate(account_id, *credentials),
+        )
+        if not owned or result is None:
+            return False
         if result == PixelStormAuthResult.SUCCESS:
             return True
         if result != PixelStormAuthResult.EMAIL_OTP_REQUIRED or self._maintenance_otp is None:
@@ -187,14 +305,73 @@ class PixelStormSecurityService:
         if otp is None:
             self._wait(operation_id, "WAITING_LOGIN_OTP", now)
             return False
-        return self._authenticate_once_with_otp(account_id, operation_id, now, credentials, otp)
+        return self._authenticate_once_with_otp(
+            account_id, operation_id, now, credentials, otp, normal_claim_token, recovery_claim_token
+        )
 
-    def _authenticate_once_with_otp(self, account_id: str, operation_id: str, now: datetime, credentials: tuple[str, str], otp: str) -> bool:
-        result = self._pixelstorm.authenticate(account_id, *credentials, otp=otp)
+    def _authenticate_once_with_otp(
+        self,
+        account_id: str,
+        operation_id: str,
+        now: datetime,
+        credentials: tuple[str, str],
+        otp: str,
+        normal_claim_token: str | None,
+        recovery_claim_token: str | None,
+    ) -> bool:
+        owned, result = self._external_side_effect(
+            operation_id,
+            now,
+            normal_claim_token,
+            recovery_claim_token,
+            lambda: self._pixelstorm.authenticate(account_id, *credentials, otp=otp),
+        )
+        if not owned or result is None:
+            return False
         if result == PixelStormAuthResult.SUCCESS:
             return True
         self._notify(self._auth_category(result), operation_id, account_id, now)
         return False
+
+    def _fence(
+        self,
+        operation_id: str,
+        now: datetime,
+        normal_claim_token: str | None,
+        recovery_claim_token: str | None,
+    ) -> bool:
+        if self._repository is None:
+            return True
+        fence_now = self._clock.now() if self._clock is not None else now
+        if recovery_claim_token is not None:
+            return self._repository.fence_recovery_side_effect(
+                operation_id, recovery_claim_token, fence_now
+            )
+        if normal_claim_token is None:
+            normal_claim_token = self._repository.get_operation(operation_id).normal_claim_token
+        return self._repository.fence_normal_side_effect(operation_id, normal_claim_token, fence_now)
+
+    def _external_side_effect(
+        self,
+        operation_id: str,
+        now: datetime,
+        normal_claim_token: str | None,
+        recovery_claim_token: str | None,
+        action,
+    ):
+        if self._repository is None:
+            return True, action()
+        if normal_claim_token is None and recovery_claim_token is None:
+            normal_claim_token = self._repository.get_operation(operation_id).normal_claim_token
+        return SideEffectLeaseGuard(
+            self._repository,
+            operation_id,
+            normal_claim_token=normal_claim_token,
+            recovery_claim_token=recovery_claim_token,
+            clock=self._clock,
+            fallback_now=now,
+            heartbeat_interval_seconds=self._lease_heartbeat_interval_seconds,
+        ).run(action)
 
     @staticmethod
     def _health_category(health: PixelStormHealth) -> str:

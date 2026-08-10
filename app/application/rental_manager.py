@@ -1,5 +1,6 @@
 from datetime import datetime
 
+from app.application.lease_guard import Clock, SideEffectLeaseGuard
 from app.domain.funpay import FunPayHealth
 from app.domain.models import OrderInput, StartResult
 from app.domain.notifications import OwnerNotification
@@ -21,6 +22,8 @@ class RentalManager:
         otp_service=None,
         message_receipts=None,
         pixelstorm_security=None,
+        clock: Clock | None = None,
+        lease_heartbeat_interval_seconds: float = 5.0,
     ) -> None:
         self.repository = repository
         self.funpay = funpay
@@ -30,6 +33,8 @@ class RentalManager:
         self._otp_service = otp_service
         self._message_receipts = message_receipts
         self._pixelstorm_security = pixelstorm_security
+        self._clock = clock
+        self._lease_heartbeat_interval_seconds = lease_heartbeat_interval_seconds
 
     def accept_order(self, order: OrderInput, now: datetime) -> StartResult:
         result = self.repository.reserve_order(order, now)
@@ -58,45 +63,75 @@ class RentalManager:
                 if claimed is None:
                     continue
             else:
-                claimed = operation
+                claimed = self.repository.claim_waiting_security_operation(operation.id, now)
+                if claimed is None:
+                    continue
             try:
                 prepared = self.repository.prepare_operation(claimed.id, now)
             except (StateConflictError, ValueError):
-                self.repository.operation_failed(claimed.id, now)
+                self.repository.operation_failed(
+                    claimed.id, now, normal_claim_token=claimed.normal_claim_token
+                )
                 continue
             if prepared is None:
                 continue
             operation = prepared
-            completed = False
+            completed: bool | None = False
             outcome: SecurityOperationOutcome | None = None
             if operation.kind == OperationKind.DISABLE_LOTS:
                 lot_ids = self.repository.account_lot_ids(operation.account_id)
                 if not lot_ids:
-                    self.repository.operation_failed(operation.id, now)
+                    self.repository.operation_failed(
+                        operation.id, now, normal_claim_token=operation.normal_claim_token
+                    )
                     continue
-                completed = self.funpay.disable_lots(operation.account_id, lot_ids).verified
+                completed = self._disable_lots(
+                    operation, now, normal_claim_token=operation.normal_claim_token
+                )
             elif operation.kind == OperationKind.SEND_CREDENTIALS:
-                completed = self._send_credentials(operation, now)
+                completed = self._send_credentials(
+                    operation, now, normal_claim_token=operation.normal_claim_token
+                )
             elif operation.kind == OperationKind.REVOKE_SESSIONS:
-                outcome = self._pixelstorm_security.execute_revoke(operation.account_id, operation.id, now) if self._pixelstorm_security is not None else SecurityOperationOutcome.FAILED_CLOSED
+                outcome = self._pixelstorm_security.execute_revoke(
+                    operation.account_id,
+                    operation.id,
+                    now,
+                    normal_claim_token=operation.normal_claim_token,
+                ) if self._pixelstorm_security is not None else SecurityOperationOutcome.FAILED_CLOSED
                 completed = outcome == SecurityOperationOutcome.COMPLETED
             elif operation.kind == OperationKind.ROTATE_PASSWORD:
-                outcome = self._pixelstorm_security.execute_rotate(operation.account_id, operation.id, now) if self._pixelstorm_security is not None else SecurityOperationOutcome.FAILED_CLOSED
+                outcome = self._pixelstorm_security.execute_rotate(
+                    operation.account_id,
+                    operation.id,
+                    now,
+                    normal_claim_token=operation.normal_claim_token,
+                ) if self._pixelstorm_security is not None else SecurityOperationOutcome.FAILED_CLOSED
                 completed = outcome == SecurityOperationOutcome.COMPLETED
             elif operation.kind == OperationKind.ENABLE_LOTS:
                 lot_ids = self.repository.account_lot_ids(operation.account_id)
                 if not lot_ids:
-                    self.repository.operation_failed(operation.id, now)
+                    self.repository.operation_failed(
+                        operation.id, now, normal_claim_token=operation.normal_claim_token
+                    )
                     continue
-                completed = self.funpay.enable_lots(operation.account_id, lot_ids).verified
+                completed = self._enable_lots(
+                    operation, now, normal_claim_token=operation.normal_claim_token
+                )
             elif operation.kind == OperationKind.SEND_OTP:
-                completed = self._send_otp(operation, now)
+                completed = self._send_otp(operation, now, normal_claim_token=operation.normal_claim_token)
             if completed:
-                self.repository.operation_completed(operation.id, now)
+                self.repository.operation_completed(
+                    operation.id, now, normal_claim_token=operation.normal_claim_token
+                )
+            elif completed is None:
+                self.repository.wait_for_buyer_otp(operation.id, now)
             elif outcome == SecurityOperationOutcome.WAITING_EXTERNAL:
                 continue
             else:
-                self.repository.operation_failed(operation.id, now)
+                self.repository.operation_failed(
+                    operation.id, now, normal_claim_token=operation.normal_claim_token
+                )
                 if operation.kind in {OperationKind.DISABLE_LOTS, OperationKind.ENABLE_LOTS}:
                     self._notify(
                         f"{operation.kind}_VERIFICATION_FAILED",
@@ -146,7 +181,7 @@ class RentalManager:
 
     def recover_message_receipts(self, now: datetime) -> int:
         recovered = 0
-        for operation in self.repository.recoverable_message_operations():
+        for operation in self.repository.recoverable_message_operations(now):
             receipt = self.funpay.get_message_receipt(operation.idempotency_key)
             if receipt is None:
                 continue
@@ -165,7 +200,10 @@ class RentalManager:
                 recovered += 1
         return recovered
 
-    def _send_credentials(self, operation, now: datetime) -> bool:
+    def _send_credentials(
+        self, operation, now: datetime, *, normal_claim_token: str | None = None
+    ) -> bool:
+        normal_claim_token = normal_claim_token or operation.normal_claim_token
         receipt = self.funpay.get_message_receipt(operation.idempotency_key)
         if receipt is not None:
             if receipt.ambiguous:
@@ -176,17 +214,27 @@ class RentalManager:
         if credentials is None:
             return False
         rental = self.repository.get_rental(operation.rental_id or "")
-        receipt = self.funpay.send_message(
-            rental.buyer_id,
-            credential_message(credentials[0], credentials[1], rental.expires_at),
-            idempotency_key=operation.idempotency_key,
-            now=now,
+        owned, receipt = self._normal_side_effect(
+            operation.id,
+            normal_claim_token,
+            now,
+            lambda: self.funpay.send_message(
+                rental.buyer_id,
+                credential_message(credentials[0], credentials[1], rental.expires_at),
+                idempotency_key=operation.idempotency_key,
+                now=now,
+            ),
         )
+        if not owned or receipt is None:
+            return False
         if self._message_receipts is not None:
             self._message_receipts.record_receipt(receipt, None)
         return receipt.delivered and receipt.verified and not receipt.ambiguous
 
-    def _send_otp(self, operation, now: datetime) -> bool:
+    def _send_otp(
+        self, operation, now: datetime, *, normal_claim_token: str | None = None
+    ) -> bool | None:
+        normal_claim_token = normal_claim_token or operation.normal_claim_token
         receipt = self.funpay.get_message_receipt(operation.idempotency_key)
         if receipt is not None:
             return receipt.delivered and receipt.verified and not receipt.ambiguous
@@ -195,10 +243,55 @@ class RentalManager:
         rental = self.repository.get_rental(operation.rental_id)
         otp = self._otp_service.request_otp(rental.id, rental.buyer_id, operation.created_at, now)
         if otp is None:
-            return False
-        receipt = self.funpay.send_message(
-            rental.buyer_id, otp, idempotency_key=operation.idempotency_key, now=now
+            return None
+        owned, receipt = self._normal_side_effect(
+            operation.id,
+            normal_claim_token,
+            now,
+            lambda: self.funpay.send_message(
+                rental.buyer_id, otp, idempotency_key=operation.idempotency_key, now=now
+            ),
         )
+        if not owned or receipt is None:
+            return False
         if self._message_receipts is not None:
             self._message_receipts.record_receipt(receipt, None)
         return receipt.delivered and receipt.verified and not receipt.ambiguous
+
+    def _disable_lots(
+        self, operation, now: datetime, *, normal_claim_token: str | None = None
+    ) -> bool:
+        lot_ids = self.repository.account_lot_ids(operation.account_id)
+        if not lot_ids:
+            return False
+        owned, result = self._normal_side_effect(
+            operation.id,
+            normal_claim_token or operation.normal_claim_token,
+            now,
+            lambda: self.funpay.disable_lots(operation.account_id, lot_ids),
+        )
+        return bool(owned and result is not None and result.verified)
+
+    def _enable_lots(
+        self, operation, now: datetime, *, normal_claim_token: str | None = None
+    ) -> bool:
+        lot_ids = self.repository.account_lot_ids(operation.account_id)
+        if not lot_ids:
+            return False
+        owned, result = self._normal_side_effect(
+            operation.id,
+            normal_claim_token or operation.normal_claim_token,
+            now,
+            lambda: self.funpay.enable_lots(operation.account_id, lot_ids),
+        )
+        return bool(owned and result is not None and result.verified)
+
+    def _normal_side_effect(self, operation_id: str, token: str | None, now: datetime, action):
+        return SideEffectLeaseGuard(
+            self.repository,
+            operation_id,
+            normal_claim_token=token,
+            clock=self._clock,
+            fallback_now=now,
+            heartbeat_interval_seconds=self._lease_heartbeat_interval_seconds,
+        ).run(action)

@@ -24,6 +24,11 @@ class StartupReconciliation:
             for operation in self.repository.running_operations():
                 if operation.kind not in {OperationKind.DISABLE_LOTS, OperationKind.ENABLE_LOTS}:
                     continue
+                if operation.lease_until is not None and operation.lease_until >= now:
+                    # A normal worker still owns this side effect.  Startup
+                    # must neither infer failure from pre-effect state nor
+                    # compete to finalize it.
+                    continue
                 lot_ids = self.repository.account_lot_ids(operation.account_id)
                 verified = bool(lot_ids) and (
                     self._funpay.verify_lots_disabled(lot_ids).verified
@@ -41,6 +46,11 @@ class StartupReconciliation:
                 recovered += 1
         if self._manager is not None and getattr(self._manager, "_pixelstorm_security", None) is not None:
             for operation in self.repository.running_operations():
+                if operation.kind not in {
+                    OperationKind.REVOKE_SESSIONS,
+                    OperationKind.ROTATE_PASSWORD,
+                }:
+                    continue
                 if operation.security_state in {
                     "WAITING_LOGIN_OTP",
                     "WAITING_PASSWORD_CHANGE_EMAIL",
@@ -61,14 +71,20 @@ class StartupReconciliation:
                     # persisting the pre-side-effect REVOKING state.
                     operation = self.repository.prepare_operation(operation.id, now) or operation
                     outcome = self._manager._pixelstorm_security.execute_revoke(
-                        operation.account_id, operation.id, now, recovery=True
+                        operation.account_id,
+                        operation.id,
+                        now,
+                        recovery=True,
+                        recovery_claim_token=token,
                     )
                 elif operation.kind == OperationKind.ROTATE_PASSWORD:
                     outcome = self._manager._pixelstorm_security.execute_rotate(
-                        operation.account_id, operation.id, now, recovery=True
+                        operation.account_id,
+                        operation.id,
+                        now,
+                        recovery=True,
+                        recovery_claim_token=token,
                     )
-                else:
-                    continue
                 if outcome == SecurityOperationOutcome.COMPLETED:
                     self.repository.complete_recovery_operation(operation.id, token, now)
                 elif outcome == SecurityOperationOutcome.FAILED_CLOSED:

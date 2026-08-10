@@ -5,7 +5,9 @@ from app.config.settings import Settings
 from app.persistence.models import Base
 
 config = context.config
-config.set_main_option("sqlalchemy.url", Settings().database_url)
+config.set_main_option(
+    "sqlalchemy.url", config.attributes.get("database_url", Settings().database_url)
+)
 target_metadata = Base.metadata
 
 

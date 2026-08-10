@@ -1,6 +1,8 @@
 import hashlib
+import json
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 from threading import Lock
 
 from app.domain.funpay import FunPayEvent, FunPayHealth, MessageReceipt
@@ -19,6 +21,7 @@ from app.domain.pixelstorm import (
 
 
 class FakeFunPayAdapter:
+    sandbox_safe = True
     def __init__(self, backend=None) -> None:
         self.lots_enabled = True
         self.calls: list[str] = []
@@ -131,6 +134,7 @@ class FakeFunPayAdapter:
 
 
 class FakeOwnerNotifier:
+    sandbox_safe = True
     """Test-only sink; deduplication prevents repeated retry notifications."""
 
     def __init__(self) -> None:
@@ -287,6 +291,14 @@ class PersistentFakePixelStormBackend:
             changed = connection.execute("UPDATE pixel_accounts SET password_hash=?, rotation_count=rotation_count+1 WHERE account_id=? AND login_hash=? AND password_hash=?", (self._digest(pending), account_id, self._digest(login), self._digest(current))).rowcount
         return PixelStormPasswordChangeResult.VERIFIED if changed else PixelStormPasswordChangeResult.INVALID
 
+    def complete_rotation(self, account_id: str, pending: str) -> PixelStormPasswordChangeResult:
+        with sqlite3.connect(self._path) as connection:
+            changed = connection.execute(
+                "UPDATE pixel_accounts SET password_hash=?, rotation_count=rotation_count+1 WHERE account_id=?",
+                (self._digest(pending), account_id),
+            ).rowcount
+        return PixelStormPasswordChangeResult.VERIFIED if changed else PixelStormPasswordChangeResult.INVALID
+
     def counter(self, account_id: str, field: str) -> int:
         if field not in {"revoke_count", "rotation_count"}:
             raise ValueError("unsupported counter")
@@ -296,10 +308,12 @@ class PersistentFakePixelStormBackend:
 
 
 class FakePixelStormAdapter:
+    sandbox_safe = True
     """In-memory Pixel Storm contract double; all outcomes are explicit and typed."""
 
     def __init__(self, backend: PersistentFakePixelStormBackend | None = None) -> None:
         self._backend = backend
+        self.business_transaction_probe = None
         self._health: dict[str, PixelStormHealth] = {}
         self._capabilities: dict[str, PixelStormSecurityCapabilities] = {}
         self._credentials: dict[str, tuple[str, str]] = {}
@@ -366,6 +380,8 @@ class FakePixelStormAdapter:
             result = queued.pop(0)
             if result == PixelStormAuthResult.SUCCESS:
                 self._health[account_id] = PixelStormHealth.READY
+                if self._backend is not None:
+                    self._backend.set_health(account_id, PixelStormHealth.READY)
             return result
         health = self.health(account_id)
         if health == PixelStormHealth.READY:
@@ -373,12 +389,16 @@ class FakePixelStormAdapter:
         return PixelStormAuthResult(health) if health in PixelStormAuthResult._value2member_map_ else PixelStormAuthResult.UNKNOWN_UI
 
     def verify_credentials(self, account_id: str, login: str, password: str) -> PixelStormCredentialResult:
+        if self.business_transaction_probe is not None:
+            self.business_transaction_probe("VERIFY_CREDENTIALS")
         if self.health(account_id) != PixelStormHealth.READY:
             return PixelStormCredentialResult(self.health(account_id)) if self.health(account_id).value in PixelStormCredentialResult._value2member_map_ else PixelStormCredentialResult.AMBIGUOUS
         valid = self._backend.verify(account_id, login, password) if self._backend is not None else self._credentials.get(account_id, (login, password)) == (login, password)
         return PixelStormCredentialResult.VALID if valid else PixelStormCredentialResult.INVALID
 
     def revoke_sessions(self, account_id: str) -> PixelStormRevocationResult:
+        if self.business_transaction_probe is not None:
+            self.business_transaction_probe("REVOKE_SESSIONS")
         self.revoke_calls.append(account_id)
         if self._backend is not None:
             return self._backend.revoke(account_id)
@@ -393,6 +413,8 @@ class FakePixelStormAdapter:
         return self._revocation.get(account_id, PixelStormRevocationResult.SUPPORTED_VERIFIED)
 
     def change_password(self, account_id: str, login: str, current_password: str, pending_password: str) -> PixelStormPasswordChangeResult:
+        if self.business_transaction_probe is not None:
+            self.business_transaction_probe("CHANGE_PASSWORD")
         self.rotation_calls.append(account_id)
         if self._backend is not None:
             return self._backend.rotate(account_id, login, current_password, pending_password)
@@ -404,7 +426,11 @@ class FakePixelStormAdapter:
         return PixelStormPasswordChangeResult.VERIFIED
 
     def request_password_change(self, account_id: str, login: str, current_password: str) -> PixelStormPasswordChangeResult:
+        if self.business_transaction_probe is not None:
+            self.business_transaction_probe("REQUEST_PASSWORD_CHANGE")
         self.password_change_requests.append(account_id)
+        if account_id in self._email_confirmation_required:
+            return PixelStormPasswordChangeResult.CONFIRMATION_REQUIRED
         if self._backend is not None:
             return PixelStormPasswordChangeResult.VERIFIED if self._backend.verify(account_id, login, current_password) else PixelStormPasswordChangeResult.INVALID
         if self._credentials.get(account_id, (login, current_password)) != (login, current_password):
@@ -412,7 +438,12 @@ class FakePixelStormAdapter:
         return PixelStormPasswordChangeResult.CONFIRMATION_REQUIRED if account_id in self._email_confirmation_required else PixelStormPasswordChangeResult.VERIFIED
 
     def complete_password_change(self, account_id: str, reset_url: str, pending_password: str) -> PixelStormPasswordChangeResult:
+        if self.business_transaction_probe is not None:
+            self.business_transaction_probe("COMPLETE_PASSWORD_CHANGE")
         del reset_url
+        if self._backend is not None:
+            self.rotation_calls.append(account_id)
+            return self._backend.complete_rotation(account_id, pending_password)
         current = self._credentials.get(account_id)
         if current is None:
             return PixelStormPasswordChangeResult.INVALID
@@ -422,6 +453,7 @@ class FakePixelStormAdapter:
 
 
 class FakeSecureStore:
+    sandbox_safe = True
     """In-memory test double; it deliberately never persists secrets."""
 
     def __init__(self) -> None:
@@ -486,39 +518,60 @@ class PersistentFakeSecureStore(FakeSecureStore):
 
     def __init__(self, vault_id: str) -> None:
         super().__init__()
-        self._vault_id = vault_id
-        with sqlite3.connect(vault_id) as connection:
-            connection.execute("CREATE TABLE IF NOT EXISTS secure_credentials (account_id TEXT PRIMARY KEY, login TEXT, current_password TEXT, pending_password TEXT, pending_created INTEGER NOT NULL DEFAULT 0)")
+        self._vault_id = Path(vault_id)
+        if not self._vault_id.exists():
+            self._write({})
+
+    def _read(self) -> dict[str, dict[str, str | int | None]]:
+        return json.loads(self._vault_id.read_text(encoding="utf-8"))
+
+    def _write(self, values: dict[str, dict[str, str | int | None]]) -> None:
+        temporary = self._vault_id.with_suffix(self._vault_id.suffix + ".tmp")
+        temporary.write_text(json.dumps(values, separators=(",", ":")), encoding="utf-8")
+        temporary.replace(self._vault_id)
 
     def set_current_credentials(self, account_id: str, login: str, password: str) -> None:
-        with sqlite3.connect(self._vault_id) as connection:
-            connection.execute("INSERT INTO secure_credentials(account_id, login, current_password) VALUES (?, ?, ?) ON CONFLICT(account_id) DO UPDATE SET login=excluded.login, current_password=excluded.current_password", (account_id, login, password))
+        values = self._read()
+        entry = values.setdefault(account_id, {})
+        entry.update(login=login, current_password=password)
+        self._write(values)
 
     def get_current_credentials(self, account_id: str) -> tuple[str, str] | None:
-        with sqlite3.connect(self._vault_id) as connection:
-            row = connection.execute("SELECT login, current_password FROM secure_credentials WHERE account_id=?", (account_id,)).fetchone()
-        return (row[0], row[1]) if row else None
+        entry = self._read().get(account_id)
+        if entry is None or not isinstance(entry.get("login"), str) or not isinstance(entry.get("current_password"), str):
+            return None
+        return str(entry["login"]), str(entry["current_password"])
 
     def get_pending_credentials(self, account_id: str) -> tuple[str, str] | None:
-        with sqlite3.connect(self._vault_id) as connection:
-            row = connection.execute("SELECT login, pending_password FROM secure_credentials WHERE account_id=? AND pending_password IS NOT NULL", (account_id,)).fetchone()
-        return (row[0], row[1]) if row else None
+        entry = self._read().get(account_id)
+        if entry is None or not isinstance(entry.get("login"), str) or not isinstance(entry.get("pending_password"), str):
+            return None
+        return str(entry["login"]), str(entry["pending_password"])
 
     def set_pending_credentials(self, account_id: str, login: str, password: str) -> None:
-        with sqlite3.connect(self._vault_id) as connection:
-            connection.execute("INSERT INTO secure_credentials(account_id, login, pending_password, pending_created) VALUES (?, ?, ?, 1) ON CONFLICT(account_id) DO UPDATE SET pending_password=COALESCE(secure_credentials.pending_password, excluded.pending_password), pending_created=secure_credentials.pending_created + CASE WHEN secure_credentials.pending_password IS NULL THEN 1 ELSE 0 END", (account_id, login, password))
+        values = self._read()
+        entry = values.setdefault(account_id, {})
+        if entry.get("pending_password") is None:
+            entry["pending_password"] = password
+            entry["pending_created"] = int(entry.get("pending_created") or 0) + 1
+        entry["login"] = login
+        self._write(values)
 
     def promote_pending_credentials(self, account_id: str) -> None:
-        with sqlite3.connect(self._vault_id) as connection:
-            connection.execute("UPDATE secure_credentials SET current_password=pending_password, pending_password=NULL WHERE account_id=? AND pending_password IS NOT NULL", (account_id,))
+        values = self._read()
+        entry = values.get(account_id)
+        if entry is not None and isinstance(entry.get("pending_password"), str):
+            entry["current_password"] = entry["pending_password"]
+            entry["pending_password"] = None
+            self._write(values)
 
     def pending_created_count(self, account_id: str) -> int:
-        with sqlite3.connect(self._vault_id) as connection:
-            row = connection.execute("SELECT pending_created FROM secure_credentials WHERE account_id=?", (account_id,)).fetchone()
-        return int(row[0]) if row else 0
+        entry = self._read().get(account_id)
+        return int(entry.get("pending_created") or 0) if entry else 0
 
 
 class FakeGmailAdapter:
+    sandbox_safe = True
     def __init__(self, messages: list[RawEmail] | None = None) -> None:
         self.messages = messages or []
 
@@ -528,6 +581,8 @@ class FakeGmailAdapter:
 
 class FakeEphemeralEmailSecretStore:
     """In-memory TTL/one-time store: no payload is ever persisted to SQLite."""
+
+    sandbox_safe = True
 
     def __init__(self) -> None:
         self._entries: dict[str, tuple[str, datetime]] = {}

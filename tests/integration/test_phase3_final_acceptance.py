@@ -55,7 +55,7 @@ def test_application_startup_immediately_recovers_running_disable_lots(tmp_path,
     funpay = FakeFunPayAdapter()
     for lot_id in lots:
         funpay.set_lot_state(lot_id, enabled=False)
-    create_application(database=restarted, funpay=funpay, now=now + timedelta(seconds=1))
+    create_application(database=restarted, funpay=funpay, now=now + timedelta(seconds=31))
     repo2 = Repository(restarted)
     assert repo2.pending_operations()[0].kind == "SEND_CREDENTIALS"
     assert repo2.get_account(account_id).status != AccountStatus.MANUAL_REVIEW
@@ -88,7 +88,7 @@ def test_application_startup_immediately_recovers_running_enable_lots(tmp_path, 
     funpay = FakeFunPayAdapter()
     for lot_id in lots:
         funpay.set_lot_state(lot_id, enabled=True)
-    create_application(database=restarted, funpay=funpay, now=now + timedelta(seconds=3))
+    create_application(database=restarted, funpay=funpay, now=now + timedelta(seconds=33))
     assert Repository(restarted).get_account(account_id).status == AccountStatus.AVAILABLE
 
 
@@ -106,7 +106,7 @@ def test_startup_lot_failure_notifies_owner_and_polling_notifies_auth_loss(core,
     funpay.set_lot_state(lots[0], enabled=False)
     from app.application.startup_reconciliation import StartupReconciliation
 
-    StartupReconciliation(repository, manager, funpay).run(now + timedelta(seconds=1))
+    StartupReconciliation(repository, manager, funpay).run(now + timedelta(seconds=31))
     assert any(item.category == "DISABLE_LOTS_VERIFICATION_FAILED" for item in notifier.notifications)
 
     transport = FakeFunPayTransport(FakeFunPayAdapter(), valid_sessions={"valid"})

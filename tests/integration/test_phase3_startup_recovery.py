@@ -127,13 +127,14 @@ def test_startup_reconciliation_recovers_send_credentials_receipt(tmp_path, now)
     started = manager.accept_order(OrderInput("credentials", "buyer", "1H", 60), now)
     manager.run_operations(now)
     operation = repository.pending_operations()[0]
-    assert repository.claim_operation(operation.id, now) is not None
+    operation = repository.claim_operation(operation.id, now)
+    assert operation is not None
     assert manager._send_credentials(operation, now)
     database.engine.dispose()
 
     repo2, manager2, funpay2 = _new_worker(path, now, {})
     manager2.funpay = FakeFunPayAdapter(backend)
-    assert StartupReconciliation(repo2, manager2, manager2.funpay).run(now) >= 1
+    assert StartupReconciliation(repo2, manager2, manager2.funpay).run(now + timedelta(seconds=31)) >= 1
     assert repo2.get_rental(started.rental_id or "").status == "ACTIVE"
     assert funpay2 is not manager2.funpay
 
@@ -171,6 +172,6 @@ def test_startup_reconciliation_recovers_send_otp_receipt(tmp_path, now):
 
     repo2, manager2, _ = _new_worker(path, now, {})
     manager2.funpay = FakeFunPayAdapter(backend)
-    assert StartupReconciliation(repo2, manager2, manager2.funpay).run(now) >= 1
+    assert StartupReconciliation(repo2, manager2, manager2.funpay).run(now + timedelta(seconds=31)) >= 1
     with repo2.db.session() as session:
         assert session.get(OperationRow, operation.id).status == "COMPLETED"

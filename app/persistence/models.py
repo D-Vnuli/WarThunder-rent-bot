@@ -72,6 +72,7 @@ class OperationRow(Base):
     maintenance_login_requested_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     password_change_requested_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     security_state: Mapped[str] = mapped_column(String(48), default="INIT")
+    normal_claim_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
     recovery_claim_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
     completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
