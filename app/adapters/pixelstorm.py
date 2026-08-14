@@ -46,6 +46,7 @@ class PixelStormBrowserSafety:
     video: str = "off"
     screenshots: bool = False
     debug_artifacts_enabled: bool = False
+    timeout_ms: int = 15_000
 
 
 class PixelStormBrowserContextFactory:
@@ -98,6 +99,7 @@ class PixelStormBrowserSessionFactory:
         self._login_url = login_url
         self._contexts = context_factory or PixelStormBrowserContextFactory()
         self._page_initializer = page_initializer
+        self._open_contexts: list[Any] = []
 
     def open_account_page(self, account_id: str) -> "PageBoundary":
         serialized = self._sessions.get_pixelstorm_session(account_id)
@@ -111,12 +113,15 @@ class PixelStormBrowserSessionFactory:
             except (TypeError, ValueError, json.JSONDecodeError):
                 self._sessions.clear_pixelstorm_session(account_id)
         context = self._contexts.new_context(self._browser, storage_state=state)
+        self._open_contexts.append(context)
         return self._new_page(context)
 
     def open_verification_page(self, account_id: str) -> "PageBoundary":
         del account_id
         # Credentials are verified without account cookies or an existing page.
-        return self._new_page(self._contexts.new_context(self._browser))
+        context = self._contexts.new_context(self._browser)
+        self._open_contexts.append(context)
+        return self._new_page(context)
 
     def persist_page_session(self, account_id: str, page: "PageBoundary") -> None:
         context = getattr(page, "context", None)
@@ -131,8 +136,18 @@ class PixelStormBrowserSessionFactory:
         if self._page_initializer is not None:
             return self._page_initializer(context, self._login_url)
         page = context.new_page()
+        set_timeout = getattr(page, "set_default_timeout", None)
+        if callable(set_timeout):
+            set_timeout(self._contexts.safety.timeout_ms)
         page.goto(self._login_url)
         return page
+
+    def close(self) -> None:
+        while self._open_contexts:
+            context = self._open_contexts.pop()
+            close = getattr(context, "close", None)
+            if callable(close):
+                close()
 
 
 @dataclass(frozen=True)
@@ -203,6 +218,8 @@ class PixelStormPageObjects:
 class PlaywrightPixelStormAdapter:
     """Adapter over real Playwright ``Page`` objects, never a synthetic snapshot."""
 
+    production_safe = True
+
     browser_safety = PixelStormBrowserSafety()
 
     def __init__(self, sessions: WebSessionStore, pages: dict[str, PageBoundary]) -> None:
@@ -223,6 +240,10 @@ class PlaywrightPixelStormAdapter:
     ) -> "PlaywrightPixelStormAdapter":
         self._verification_factory = factory
         return self
+
+    def close(self) -> None:
+        if self._browser_sessions is not None:
+            self._browser_sessions.close()
 
     def _inspection(self, account_id: str) -> PixelStormPageInspection:
         page = self._pages.get(account_id)

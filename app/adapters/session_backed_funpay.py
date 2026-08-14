@@ -9,6 +9,8 @@ from app.domain.ports import FunPayTransport, WebSessionStore
 class SessionBackedFunPayAdapter:
     """Runtime gate that obtains a FunPay web session only from WebSessionStore."""
 
+    production_safe = True
+
     def __init__(self, account_id: str, sessions: WebSessionStore, transport: FunPayTransport) -> None:
         self._account_id = account_id
         self._sessions = sessions

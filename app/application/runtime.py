@@ -23,6 +23,7 @@ class ApplicationRuntime:
     scheduler: DurableScheduler
     startup: StartupReconciliation
     last_poll_at: datetime
+    resource_closers: tuple[object, ...] = ()
 
     def run_once(self, now: datetime) -> None:
         """One bounded, deterministic processing cycle; no background loop."""
@@ -41,6 +42,10 @@ class ApplicationRuntime:
         return self.startup.run(now)
 
     def close(self) -> None:
+        for resource in self.resource_closers:
+            close = getattr(resource, "close", None)
+            if callable(close):
+                close()
         engine = getattr(getattr(self.repository, "db", None), "engine", None)
         if engine is not None:
             engine.dispose()

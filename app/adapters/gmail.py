@@ -157,6 +157,8 @@ class GmailApiTransport:
 class GmailOAuthAdapter:
     """OAuth boundary; credentials remain solely in OAuthTokenStore."""
 
+    production_safe = True
+
     def __init__(
         self,
         token_store: OAuthTokenStore,

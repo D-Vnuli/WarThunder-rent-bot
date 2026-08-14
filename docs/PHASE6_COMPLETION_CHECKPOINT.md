@@ -1,0 +1,7 @@
+PHASE6_STATUS=COMPLETE
+LAST_COMPLETED_ITEM=PHASE6_FULL_ACCEPTANCE
+NEXT_ITEM=NONE
+TARGETED_TESTS_PASS=PHASE6 integrated runtime acceptance;PHASE0-5 regression
+MISSING_ACCEPTANCE_ITEMS=NONE
+KNOWN_FAILURES=none
+DO_NOT_REDO=accepted PHASE0-5 and already-valid Phase6 database/backup/single-instance primitives

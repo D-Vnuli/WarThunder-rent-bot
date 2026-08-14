@@ -14,6 +14,16 @@ class Database:
         )
         if url.startswith("sqlite"):
             event.listen(self.engine, "connect", self._enable_foreign_keys)
+            # Establish WAL once when practical.  It must not run as a connect
+            # hook because simultaneous worker startup can contend on SQLite's
+            # journal-mode transition before normal lease recovery begins.
+            try:
+                with self.engine.connect() as connection:
+                    connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            except Exception:
+                # A concurrent opener will observe the already-selected mode;
+                # normal DB/integrity preflight remains the authority.
+                pass
         event.listen(self.engine, "begin", self._transaction_started)
         event.listen(self.engine, "commit", self._transaction_finished)
         event.listen(self.engine, "rollback", self._transaction_finished)
@@ -40,4 +50,5 @@ class Database:
     def _enable_foreign_keys(dbapi_connection: Any, _: object) -> None:
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA busy_timeout=15000")
         cursor.close()

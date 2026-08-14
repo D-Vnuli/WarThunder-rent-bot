@@ -1,7 +1,9 @@
 """Application composition root.  Importing this module has no runtime side effects."""
 
+import argparse
 from datetime import UTC, datetime
-from typing import cast
+from pathlib import Path
+from typing import Any, cast
 
 from app.adapters.email_classifier import EmailClassifier
 from app.adapters.fake import (
@@ -39,7 +41,11 @@ from app.persistence.funpay_events import FunPayEventRepository
 from app.persistence.repositories import Repository
 
 
-def _require_sandbox_adapter(adapter: object, label: str) -> None:
+def _require_runtime_adapter(adapter: object, label: str, settings: Settings) -> None:
+    if settings.app_mode == "PRODUCTION":
+        if not getattr(adapter, "production_safe", False):
+            raise RuntimeError(f"PRODUCTION requires explicit production {label} adapter")
+        return
     if not getattr(adapter, "sandbox_safe", False):
         raise RuntimeError(f"SANDBOX/DRY_RUN refuses non-sandbox {label} adapter")
 
@@ -57,6 +63,7 @@ def create_application(
     now: datetime | None = None,
     clock: Clock | None = None,
     lease_heartbeat_interval_seconds: float = 5.0,
+    start_reconciliation: bool = True,
 ) -> ApplicationRuntime:
     """Compose the real application layer with explicitly safe adapters only."""
     settings = settings or Settings()
@@ -73,7 +80,7 @@ def create_application(
         (runtime_secrets, "SecureStore"),
         (runtime_gmail, "Gmail"),
     ):
-        _require_sandbox_adapter(adapter, label)
+        _require_runtime_adapter(adapter, label, settings)
 
     repository = Repository(
         database,
@@ -129,7 +136,8 @@ def create_application(
     )
     startup = StartupReconciliation(repository, manager, runtime_funpay)
     runtime_now = now or datetime.now(UTC)
-    startup.run(runtime_now)
+    if start_reconciliation:
+        startup.run(runtime_now)
     return ApplicationRuntime(
         repository,
         manager,
@@ -140,12 +148,49 @@ def create_application(
         DurableScheduler(repository, manager),
         startup,
         runtime_now,
+        (runtime_funpay, runtime_pixelstorm, runtime_gmail),
     )
 
 
-def run_application() -> None:
-    """Deliberately bounded runtime entrypoint; services drive recurring calls externally."""
-    create_application()
+def run_application(argv: list[str] | None = None) -> None:
+    """Production service entrypoint; ``--dry-run`` remains bounded for operators/tests."""
+    parser = argparse.ArgumentParser(description="War Thunder rent-bot runtime")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--database-url")
+    parser.add_argument("--runtime-dir")
+    arguments = parser.parse_args(argv)
+    if not arguments.dry_run:
+        from app.production import create_production_application
+
+        settings = Settings()
+        if not settings.production_like:
+            raise RuntimeError("PRODUCTION_RUNTIME_REQUIRED")
+        runtime = create_production_application(settings)
+        runtime.install_signal_handlers()
+        try:
+            runtime.run_forever()
+        finally:
+            runtime.shutdown()
+        return
+    from app.production import create_production_application
+
+    values: dict[str, Any] = {"app_mode": "PRODUCTION_DRY_RUN", "dry_run": True}
+    if arguments.database_url:
+        values["database_url"] = arguments.database_url
+    if arguments.runtime_dir:
+        runtime_dir = Path(arguments.runtime_dir)
+        values.update(
+            runtime_dir=runtime_dir,
+            secure_store_path=runtime_dir / "secure-store.vault",
+            web_session_store_path=runtime_dir / "web-session.vault",
+            log_path=runtime_dir / "logs" / "app.jsonl",
+            backup_dir=runtime_dir / "backups",
+        )
+    runtime = create_production_application(Settings(**values))
+    try:
+        print({check.name: check.state for check in runtime.start()})
+    finally:
+        runtime.shutdown()
 
 
 if __name__ == "__main__":
